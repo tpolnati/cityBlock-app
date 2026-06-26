@@ -1,0 +1,26 @@
+# LuminaMaps - Internal 3D Map Manufacturing Tool
+# Core dependencies. Pinned to major versions known to be API-compatible
+# with the code in this repo (osmnx 2.x feature/projection API).
+
+# --- UI ---
+streamlit>=1.30,<2.0
+
+# --- Data retrieval ---
+osmnx>=2.0,<3.0
+networkx>=3.0          # required by osmnx for road graphs
+
+# --- Geometry processing ---
+geopandas>=1.0
+shapely>=2.0
+pyproj>=3.6            # CRS / UTM projection backend
+mapclassify>=2.6       # used by geopandas/osmnx plotting helpers
+
+# --- 3D mesh generation (used from Step 2 onward) ---
+trimesh>=4.0
+numpy-stl>=3.1
+manifold3d>=2.3        # robust boolean engine for trimesh
+
+# --- Numerics / plotting ---
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8

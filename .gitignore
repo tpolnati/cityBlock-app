@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# osmnx on-disk HTTP cache
+cache/
+.cache/
+
+# Generated 3D output (Step 2+)
+output/
+*.stl
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
