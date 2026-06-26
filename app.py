@@ -130,6 +130,9 @@ def _render_tile_preview(tile: geometry_processor.TileGeom) -> None:
     _plot_polys(ax, tile.roads, color="#888888", alpha=0.8, linewidth=0)
     for _h, geom in tile.building_bins:
         _plot_polys(ax, geom, color="#2b2b2b", linewidth=0)
+    # Landmarks / 3D parts highlighted in gold so attractions stand out.
+    for _zb, _zt, geom in tile.detail_buildings:
+        _plot_polys(ax, geom, color="#d4a017", alpha=0.95, linewidth=0)
     ax.set_aspect("equal")
     ax.set_xlim(-half_w * 1.05, half_w * 1.05)
     ax.set_ylim(-half_h * 1.05, half_h * 1.05)
@@ -291,6 +294,31 @@ def main() -> None:
             help="Adjusting this recomputes ONLY the 3D mesh — the OSM data is "
                  "cached and is not re-downloaded.",
         )
+
+        detail_options = list(geometry_processor.DETAIL_LEVELS.keys())
+        detail_level = st.select_slider(
+            "Detail level",
+            options=detail_options,
+            value=geometry_processor.DEFAULT_DETAIL_LEVEL,
+            help="Higher levels keep landmarks razor-sharp and reconstruct "
+                 "skyscraper setbacks from OSM building:part data.",
+        )
+        st.caption(geometry_processor.DETAIL_LEVELS[detail_level]["blurb"])
+        landmark_emphasis = st.slider(
+            "Landmark emphasis ×",
+            min_value=1.0, max_value=3.0, value=1.0, step=0.1,
+            help="Extra height multiplier applied to landmarks & 3D parts so "
+                 "major attractions (e.g. Burj Khalifa) tower over the city.",
+            disabled=not geometry_processor.DETAIL_LEVELS[detail_level]["landmarks"],
+        )
+        max_height_mm = st.slider(
+            "Max relief height (mm)",
+            min_value=10.0, max_value=150.0,
+            value=float(geometry_processor.DEFAULT_MAX_HEIGHT_MM), step=5.0,
+            help="Printable ceiling. The tallest features smoothly approach this "
+                 "height (so an 800 m tower won't print a metre tall) while small "
+                 "buildings stay near true-to-scale.",
+        )
         carve = st.checkbox("Carve water/roads into base", value=True)
         weld = st.checkbox(
             "Weld into single manifold (boolean union — slower)", value=False,
@@ -308,6 +336,9 @@ def main() -> None:
             with st.spinner("Processing 2D geometry (crop, union, buffer, simplify)…"):
                 tiles = geometry_processor.prepare_tiles(
                     md, preset, z_mult,
+                    detail_level=detail_level,
+                    landmark_emphasis=landmark_emphasis,
+                    max_height_mm=max_height_mm,
                     include_water=inc_water,
                     include_roads=inc_roads,
                     include_parks=inc_parks,
@@ -325,12 +356,14 @@ def main() -> None:
                     "bytes": tm.to_stl_bytes(),
                     "triangles": tm.triangles,
                     "watertight": tm.watertight,
+                    "landmarks": tg.detail_count,
                     "dims": (round(dims[0], 1), round(dims[1], 1), round(dims[2], 1)),
                     "preview": tg,
                 })
             st.session_state["generated"] = generated
+            emph = f" · landmarks ×{landmark_emphasis:g}" if landmark_emphasis != 1.0 else ""
             st.session_state["gen_caption"] = (
-                f"{preset_name} · Z×{z_mult:g} · "
+                f"{preset_name} · Z×{z_mult:g} · {detail_level} detail{emph} · "
                 f"{'welded' if weld else 'concatenated'}"
                 f"{' · carved' if carve else ''}"
             )
@@ -356,10 +389,11 @@ def main() -> None:
             with col:
                 wt = "✅ watertight" if item["watertight"] else "⚠️ not watertight"
                 w, h, t = item["dims"]
+                lm = f"  \n⭐ {item['landmarks']} landmark/3D pieces" if item.get("landmarks") else ""
                 st.markdown(
                     f"**{item['name']}**  \n"
                     f"{w} × {h} × {t} mm  \n"
-                    f"{item['triangles']:,} triangles  \n{wt}"
+                    f"{item['triangles']:,} triangles  \n{wt}{lm}"
                 )
                 st.download_button(
                     "⬇️ Download STL",

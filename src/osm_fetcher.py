@@ -40,7 +40,13 @@ ox.settings.requests_timeout = 180
 # OSM tag filters for each feature layer. Kept deliberately *broad* — per the
 # project brief we must NOT cull small/unique footprints, so we pull every
 # building and a wide net of land features.
-BUILDING_TAGS = {"building": True}
+#
+# We always pull `building:part` too (the "Simple 3D Buildings" scheme). These
+# are the per-section polygons — each with its own `height` / `min_height` —
+# that encode the setbacks, tapers and spires of landmarks like the Burj
+# Khalifa. They are cheap to fetch and let the Detail Level control decide
+# whether to *use* them, so toggling detail never triggers a re-download.
+BUILDING_TAGS = {"building": True, "building:part": True}
 
 WATER_TAGS = {
     "natural": ["water", "bay", "strait"],

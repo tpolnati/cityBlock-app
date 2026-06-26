@@ -64,6 +64,39 @@ a thin base for LED backlighting; Tier 1 uses a thick solid base for a desk piec
 
 ---
 
+## Landmark detail
+
+Major attractions need to be **recognisable** in the print — a flat box where the
+Burj Khalifa should be won't do. The app handles this with three mechanisms:
+
+- **`building:part` (Simple 3D Buildings).** OSM stores skyscraper massing as
+  stacked part-polygons, each with its own `height` and `min_height`. At **High**
+  / **Maximum** detail these are extruded individually, reproducing setbacks and
+  the tapering spire that make a tower identifiable.
+- **Landmark detection.** Buildings tagged `tourism`/`historic`/`man_made=tower`,
+  carrying a `wikidata`/`wikipedia` reference, having a notable `building` value
+  (cathedral, stadium, tower…), or simply very tall are flagged as landmarks.
+  They're kept at full footprint fidelity (little/no simplification) and never
+  merged into their neighbours. They're highlighted **gold** in the 2D preview.
+- **Printable height with preserved silhouette.** A landmark's parts are scaled
+  *proportionally to that building's own height*, and the overall top is bounded
+  by **Max relief height** via a smooth `tanh` knee. So an 828 m tower tops out
+  at (say) 50 mm instead of printing a metre tall — while the 200 / 450 / 650 m
+  setbacks keep their exact ratios and the spire still reads as the spire. Small
+  buildings nearby stay near true-to-scale.
+
+### Detail levels
+
+| Level | building:part | Landmarks | Simplification | Use it for |
+|---|---|---|---|---|
+| **Standard** | off | off | coarse | Fast drafts; flat-topped prisms |
+| **High** (default) | on | on | light on landmarks | Most maps — sharp landmarks, fast bulk |
+| **Maximum** | on | on | none | Hero pieces; every node preserved |
+
+The **Landmark emphasis ×** slider adds extra height to landmarks/parts so they
+tower further above the city; **Max relief height** caps the tallest feature so
+prints stay sensible. Changing any of these recomputes the mesh only — no refetch.
+
 ## Project structure
 
 ```
@@ -103,7 +136,9 @@ The fetch layer is the **only** code that touches the network and is wrapped in
 |---|---|---|
 | Level height | `geometry_processor.LEVEL_HEIGHT_M` | 3.0 m |
 | Random height fallback | `geometry_processor.DEFAULT_MIN_M / MAX_M` | 3–9 m |
-| Simplify tolerance | `geometry_processor.SIMPLIFY_M` | 0.20 m |
+| Detail-level simplify tolerances | `geometry_processor.DETAIL_LEVELS` | 0.0–0.30 m |
+| Max relief height (cap) | `geometry_processor.DEFAULT_MAX_HEIGHT_MM` | 50 mm |
+| Landmark height thresholds | `geometry_processor.LANDMARK_*_HEIGHT_M` | 60 / 120 m |
 | Height bin size | `geometry_processor.HEIGHT_BIN_MM` | 0.5 mm |
 | Road / waterway widths | `geometry_processor.ROAD_WIDTH_M / WATERWAY_WIDTH_M` | by OSM class |
 | Carve depth | `mesh_generator.CARVE_MAX_MM` | 1.2 mm |

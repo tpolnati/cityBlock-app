@@ -155,11 +155,22 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
         if pm is not None:
             parts.append(pm)
 
-    # --- Buildings (slightly embedded into the base) --------------------------
+    # --- Bulk buildings (slightly embedded into the base) ---------------------
     for height_mm, geom in tile.building_bins:
         bm = _extrude(geom, height_mm + EMBED_MM, z0=base_t - EMBED_MM)
         if bm is not None:
             parts.append(bm)
+
+    # --- Landmark / 3D-part pieces (stacked between z_bottom and z_top) --------
+    # Each part sinks EMBED_MM into whatever sits below it (the base for ground
+    # parts, the previous setback for upper parts) so the stack welds solidly.
+    for z_bottom, z_top, geom in tile.detail_buildings:
+        height = (z_top - z_bottom) + EMBED_MM
+        if height <= 0:
+            continue
+        dm = _extrude(geom, height, z0=base_t + z_bottom - EMBED_MM)
+        if dm is not None:
+            parts.append(dm)
 
     # --- Combine --------------------------------------------------------------
     if weld and len(parts) > 1:
