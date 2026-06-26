@@ -1,20 +1,196 @@
 """3D mesh generation + STL export for LuminaMaps (Step 2).
 
-All ``trimesh`` / ``numpy-stl`` work lives here: extruding 2D polygons,
-generating the solid base plate, carving negative space for water/roads,
-scaling to the physical bed size, centering to the origin (X=0, Y=0), ensuring
-a flat watertight bottom at Z=0, and merging everything into a single STL.
+All ``trimesh`` work lives here. Consumes millimetre-space ``TileGeom`` objects
+from ``geometry_processor`` and produces watertight, manifold-friendly STL
+meshes, one per printed tile.
 
-NOTE: Intentionally left as a stub. Per the Step 1 instructions we stop after
-the data fetch is verified and do NOT implement 3D generation yet.
+Construction per tile
+----------------------
+* Solid rectangular **base plate**: bottom flush at Z=0, top at Z=base_mm.
+* **Buildings**: extruded prisms, slightly embedded into the base for a solid
+  weld, rising from the base top.
+* **Parks**: a thin raised pad on the base top (subtle land texture).
+* **Water / roads**: carved as recessed channels into the base top via boolean
+  difference (the "negative space"), with a graceful fallback if the boolean
+  engine struggles on pathological geometry.
+* Everything is centred at X=0, Y=0 and the bottom sits flush at Z=0.
 """
 
 from __future__ import annotations
 
-# Implemented in Step 2:
-#   - build_base_plate(size_mm, base_mm)    -> solid rectangular plate
-#   - extrude_buildings(polys, heights)     -> trimesh extrusions
-#   - subtract_features(mesh, cutters)      -> boolean carve water/roads
-#   - scale_to_bed(mesh, size_mm)           -> fit physical bed
-#   - center_to_origin(mesh)                -> X=0, Y=0, flush Z=0
-#   - export_stl(mesh, path)                -> watertight, manifold output
+import io
+from dataclasses import dataclass
+
+import numpy as np
+import trimesh
+
+from src.geometry_processor import TileGeom
+
+# Depth (mm) of carved water/road channels, capped relative to base thickness.
+CARVE_MAX_MM = 1.2
+# How far (mm) buildings/parks sink into the base top to guarantee a solid weld.
+EMBED_MM = 0.2
+# Thin raised park layer thickness (mm).
+PARK_MAX_MM = 0.8
+
+
+@dataclass
+class TileMesh:
+    """A finished tile mesh plus a few stats for the UI."""
+
+    name: str
+    mesh: trimesh.Trimesh
+
+    @property
+    def triangles(self) -> int:
+        return len(self.mesh.faces)
+
+    @property
+    def watertight(self) -> bool:
+        return bool(self.mesh.is_watertight)
+
+    @property
+    def dims_mm(self) -> tuple[float, float, float]:
+        ext = self.mesh.extents
+        return (float(ext[0]), float(ext[1]), float(ext[2]))
+
+    def to_stl_bytes(self) -> bytes:
+        return self.mesh.export(file_type="stl")
+
+
+# ---------------------------------------------------------------------------
+# Polygon -> mesh helpers
+# ---------------------------------------------------------------------------
+def _iter_polys(geom):
+    """Yield individual shapely Polygons from any (Multi)Polygon / collection."""
+    if geom is None or geom.is_empty:
+        return
+    gtype = geom.geom_type
+    if gtype == "Polygon":
+        yield geom
+    elif gtype in ("MultiPolygon", "GeometryCollection"):
+        for g in geom.geoms:
+            yield from _iter_polys(g)
+
+
+def _extrude(geom, height: float, z0: float = 0.0):
+    """Extrude a (Multi)Polygon to a given height, optionally lifted to ``z0``.
+
+    Returns a single concatenated ``Trimesh`` or ``None``. Individual polygon
+    failures are skipped so one bad ring can't sink the tile.
+    """
+    if height <= 0:
+        return None
+    meshes = []
+    for poly in _iter_polys(geom):
+        if poly.area <= 0:
+            continue
+        poly = poly.buffer(0)            # heal self-touching rings
+        for clean in _iter_polys(poly):
+            if clean.area <= 0:
+                continue
+            try:
+                m = trimesh.creation.extrude_polygon(clean, height)
+            except Exception:            # noqa: BLE001 - degenerate triangulation
+                continue
+            if z0:
+                m.apply_translation([0.0, 0.0, z0])
+            meshes.append(m)
+    if not meshes:
+        return None
+    return trimesh.util.concatenate(meshes)
+
+
+def _base_plate(width_mm: float, height_mm: float, thickness_mm: float) -> trimesh.Trimesh:
+    """Solid centred base box: bottom at Z=0, top at Z=thickness."""
+    plate = trimesh.creation.box(extents=[width_mm, height_mm, thickness_mm])
+    plate.apply_translation([0.0, 0.0, thickness_mm / 2.0])
+    return plate
+
+
+def _carve(base: trimesh.Trimesh, cutter_geom, depth: float, top_z: float):
+    """Subtract recessed channels (cutter extruded down from ``top_z``) from base.
+
+    Returns (mesh, carved?). On any boolean failure, returns the untouched base
+    so the tile still exports.
+    """
+    if cutter_geom is None or depth <= 0:
+        return base, False
+    cutter = _extrude(cutter_geom, depth)
+    if cutter is None:
+        return base, False
+    cutter.apply_translation([0.0, 0.0, top_z - depth])
+    try:
+        result = trimesh.boolean.difference([base, cutter])
+        if result is None or result.is_empty or len(result.faces) == 0:
+            return base, False
+        return result, True
+    except Exception:                    # noqa: BLE001 - boolean engine hiccup
+        return base, False
+
+
+# ---------------------------------------------------------------------------
+# Tile assembly
+# ---------------------------------------------------------------------------
+def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = False) -> TileMesh:
+    """Assemble a single printable tile mesh from its prepared geometry."""
+    base_t = tile.base_mm
+    parts: list[trimesh.Trimesh] = []
+
+    # --- Base plate, optionally carved with water + roads ---------------------
+    base = _base_plate(tile.size_w_mm, tile.size_h_mm, base_t)
+    if carve_features:
+        cutters = [g for g in (tile.water, tile.roads) if g is not None]
+        if cutters:
+            from shapely.ops import unary_union
+
+            depth = min(CARVE_MAX_MM, base_t * 0.6)
+            base, _ = _carve(base, unary_union(cutters), depth, base_t)
+    parts.append(base)
+
+    # --- Thin raised park pads ------------------------------------------------
+    if tile.parks is not None:
+        park_t = min(PARK_MAX_MM, base_t * 0.4)
+        pm = _extrude(tile.parks, park_t, z0=base_t)
+        if pm is not None:
+            parts.append(pm)
+
+    # --- Buildings (slightly embedded into the base) --------------------------
+    for height_mm, geom in tile.building_bins:
+        bm = _extrude(geom, height_mm + EMBED_MM, z0=base_t - EMBED_MM)
+        if bm is not None:
+            parts.append(bm)
+
+    # --- Combine --------------------------------------------------------------
+    if weld and len(parts) > 1:
+        try:
+            mesh = trimesh.boolean.union(parts)
+            if mesh is None or mesh.is_empty:
+                mesh = trimesh.util.concatenate(parts)
+        except Exception:                # noqa: BLE001
+            mesh = trimesh.util.concatenate(parts)
+    else:
+        mesh = trimesh.util.concatenate(parts)
+
+    _finalize(mesh)
+    return TileMesh(name=tile.name, mesh=mesh)
+
+
+def _finalize(mesh: trimesh.Trimesh) -> None:
+    """Clean up + guarantee the mesh is centred in XY and flush at Z=0."""
+    mesh.merge_vertices()
+    # trimesh 4.x: filter faces via boolean/index masks rather than removed helpers.
+    mesh.update_faces(mesh.nondegenerate_faces())
+    mesh.update_faces(mesh.unique_faces())
+    mesh.fix_normals()
+    # Centre X/Y on the origin; drop the bottom to exactly Z=0.
+    minx, miny, minz = mesh.bounds[0]
+    maxx, maxy, _ = mesh.bounds[1]
+    cx = (minx + maxx) / 2.0
+    cy = (miny + maxy) / 2.0
+    mesh.apply_translation([-cx, -cy, -minz])
+
+
+def build_all(tiles: list[TileGeom], *, carve_features: bool = True, weld: bool = False) -> list[TileMesh]:
+    """Build every tile in a preset (1 tile normally, 4 for the Tier-3 mega map)."""
+    return [build_tile(t, carve_features=carve_features, weld=weld) for t in tiles]

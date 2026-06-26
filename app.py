@@ -3,21 +3,23 @@
 Streamlit front-end for generating 3D-printable city-map STLs from real-world
 OpenStreetMap data, formatted for specific printers / shadowbox frame sizes.
 
-STEP 1 SCOPE
-------------
-This file currently implements the UI, Streamlit session-state management,
-the Preset system, dynamic UTM projection, and the cached data fetch +
-validation. The actual 3D mesh generation (geometry_processor / mesh_generator)
-is wired in during Step 2 — for now we stop after confirming the map data
-fetches correctly and preview it visually.
+Scope
+-----
+* Step 1: UI, session-state management, preset system, dynamic UTM projection,
+  cached data fetch + validation, 2D preview.
+* Step 2: full 2D -> 3D pipeline (geometry_processor + mesh_generator) — height
+  resolution, bbox cropping, footprint unioning, line buffering, extrusion,
+  water/road carving, tiling, centering, watertight STL export with downloads.
 """
 
 from __future__ import annotations
 
+import re
+
 import matplotlib.pyplot as plt
 import streamlit as st
 
-from src import osm_fetcher
+from src import geometry_processor, mesh_generator, osm_fetcher
 
 # ---------------------------------------------------------------------------
 # Preset system
@@ -73,6 +75,8 @@ def _init_state() -> None:
         "last_radius": None,       # the radius that produced map_data
         "center_latlon": None,     # (lat, lon)
         "fetch_error": None,       # str | None
+        "generated": None,         # list[dict] of exported tiles, or None
+        "gen_caption": "",         # human-readable description of last generation
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -101,6 +105,45 @@ def _render_preview(md: osm_fetcher.MapData) -> None:
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
+
+def _plot_polys(ax, geom, **kwargs):
+    """Plot a shapely (Multi)Polygon onto a matplotlib axis."""
+    if geom is None or geom.is_empty:
+        return
+    geoms = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
+    for poly in geoms:
+        if poly.geom_type != "Polygon":
+            continue
+        xs, ys = poly.exterior.xy
+        ax.fill(xs, ys, **kwargs)
+
+
+def _render_tile_preview(tile: geometry_processor.TileGeom) -> None:
+    """Top-down preview of a single prepared tile in millimetre space."""
+    fig, ax = plt.subplots(figsize=(5, 5))
+    half_w, half_h = tile.size_w_mm / 2.0, tile.size_h_mm / 2.0
+    ax.add_patch(plt.Rectangle((-half_w, -half_h), tile.size_w_mm, tile.size_h_mm,
+                               fill=False, edgecolor="#cccccc", linewidth=1))
+    _plot_polys(ax, tile.parks, color="#7bb274", alpha=0.5, linewidth=0)
+    _plot_polys(ax, tile.water, color="#4a90d9", alpha=0.7, linewidth=0)
+    _plot_polys(ax, tile.roads, color="#888888", alpha=0.8, linewidth=0)
+    for _h, geom in tile.building_bins:
+        _plot_polys(ax, geom, color="#2b2b2b", linewidth=0)
+    ax.set_aspect("equal")
+    ax.set_xlim(-half_w * 1.05, half_w * 1.05)
+    ax.set_ylim(-half_h * 1.05, half_h * 1.05)
+    ax.set_title(f"{tile.name} — {tile.size_w_mm:g} × {tile.size_h_mm:g} mm")
+    ax.set_xlabel("mm")
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _slugify(text: str) -> str:
+    """Turn a location string into a safe filename stem."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "luminamap").strip().lower())
+    return slug.strip("-") or "luminamap"
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +275,100 @@ def main() -> None:
                 }
             )
         st.caption(
-            "Verify the layers above look correct. 3D extrusion + STL export "
-            "arrives in Step 2."
+            "Verify the layers above look correct, then generate the 3D model below."
         )
+
+    # ---- 4 · 3D generation & export -------------------------------------
+    st.divider()
+    st.header("4 · 3D Generation & Export")
+
+    g1, g2 = st.columns([2, 3])
+    with g1:
+        z_mult = st.slider(
+            "Z-axis multiplier (height exaggeration)",
+            min_value=1.0, max_value=6.0,
+            value=float(preset["z_mult"]), step=0.1,
+            help="Adjusting this recomputes ONLY the 3D mesh — the OSM data is "
+                 "cached and is not re-downloaded.",
+        )
+        carve = st.checkbox("Carve water/roads into base", value=True)
+        weld = st.checkbox(
+            "Weld into single manifold (boolean union — slower)", value=False,
+            help="Off: fast concatenation (buildings embedded into the base, "
+                 "slicer-safe). On: a true boolean union for a perfectly manifold file.",
+        )
+        feat = st.columns(3)
+        inc_water = feat[0].checkbox("Water", value=True)
+        inc_roads = feat[1].checkbox("Roads", value=True)
+        inc_parks = feat[2].checkbox("Parks", value=True)
+        generate = st.button("🧱 Generate STL(s)", type="primary", use_container_width=True)
+
+    if generate:
+        try:
+            with st.spinner("Processing 2D geometry (crop, union, buffer, simplify)…"):
+                tiles = geometry_processor.prepare_tiles(
+                    md, preset, z_mult,
+                    include_water=inc_water,
+                    include_roads=inc_roads,
+                    include_parks=inc_parks,
+                )
+            with st.spinner(f"Extruding {len(tiles)} tile(s) and exporting STL…"):
+                meshes = mesh_generator.build_all(tiles, carve_features=carve, weld=weld)
+
+            stem = _slugify(st.session_state["last_query"])
+            generated = []
+            for tg, tm in zip(tiles, meshes):
+                dims = tm.dims_mm
+                generated.append({
+                    "name": tm.name,
+                    "filename": f"luminamap_{stem}_{tm.name}.stl",
+                    "bytes": tm.to_stl_bytes(),
+                    "triangles": tm.triangles,
+                    "watertight": tm.watertight,
+                    "dims": (round(dims[0], 1), round(dims[1], 1), round(dims[2], 1)),
+                    "preview": tg,
+                })
+            st.session_state["generated"] = generated
+            st.session_state["gen_caption"] = (
+                f"{preset_name} · Z×{z_mult:g} · "
+                f"{'welded' if weld else 'concatenated'}"
+                f"{' · carved' if carve else ''}"
+            )
+        except Exception as exc:  # noqa: BLE001 - surface a clean error in the UI
+            st.session_state["generated"] = None
+            st.error(f"3D generation failed: {exc}")
+
+    # ---- Generated results (persist across reruns / downloads) -----------
+    generated = st.session_state["generated"]
+    if generated:
+        st.success(
+            f"Generated **{len(generated)}** STL tile(s) — {st.session_state['gen_caption']}."
+        )
+        with g2:
+            _render_tile_preview(generated[0]["preview"])
+            if len(generated) > 1:
+                st.caption(f"Preview shows {generated[0]['name']} of {len(generated)} tiles.")
+
+        st.subheader("Export")
+        cols = st.columns(min(len(generated), 4))
+        for idx, item in enumerate(generated):
+            col = cols[idx % len(cols)]
+            with col:
+                wt = "✅ watertight" if item["watertight"] else "⚠️ not watertight"
+                w, h, t = item["dims"]
+                st.markdown(
+                    f"**{item['name']}**  \n"
+                    f"{w} × {h} × {t} mm  \n"
+                    f"{item['triangles']:,} triangles  \n{wt}"
+                )
+                st.download_button(
+                    "⬇️ Download STL",
+                    data=item["bytes"],
+                    file_name=item["filename"],
+                    mime="model/stl",
+                    use_container_width=True,
+                    key=f"dl_{idx}",
+                )
 
 
 if __name__ == "__main__":

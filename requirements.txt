@@ -15,10 +15,11 @@ shapely>=2.0
 pyproj>=3.6            # CRS / UTM projection backend
 mapclassify>=2.6       # used by geopandas/osmnx plotting helpers
 
-# --- 3D mesh generation (used from Step 2 onward) ---
+# --- 3D mesh generation ---
 trimesh>=4.0
 numpy-stl>=3.1
-manifold3d>=2.3        # robust boolean engine for trimesh
+manifold3d>=2.3        # robust boolean engine (weld + carve)
+mapbox-earcut>=1.0     # polygon triangulation backend for trimesh extrusion
 
 # --- Numerics / plotting ---
 numpy>=1.26
