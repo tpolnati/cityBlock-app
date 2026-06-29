@@ -8,6 +8,7 @@ streamlit>=1.30,<2.0
 # --- Data retrieval ---
 osmnx>=2.0,<3.0
 networkx>=3.0          # required by osmnx for road graphs
+requests>=2.31         # Wikidata / Wikimedia Commons / Sketchfab model fetching
 
 # --- Geometry processing ---
 geopandas>=1.0

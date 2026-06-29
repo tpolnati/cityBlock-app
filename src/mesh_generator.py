@@ -19,12 +19,13 @@ Construction per tile
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import trimesh
 
-from src.geometry_processor import TileGeom
+from src import landmark_models, roofs
+from src.geometry_processor import LandmarkRecord, TileGeom
 
 # Depth (mm) of carved water/road channels, capped relative to base thickness.
 CARVE_MAX_MM = 1.2
@@ -40,6 +41,8 @@ class TileMesh:
 
     name: str
     mesh: trimesh.Trimesh
+    # Human-readable note per landmark that got a detailed downloaded model.
+    model_sources: list[str] = field(default_factory=list)
 
     @property
     def triangles(self) -> int:
@@ -132,10 +135,53 @@ def _carve(base: trimesh.Trimesh, cutter_geom, depth: float, top_z: float):
 # ---------------------------------------------------------------------------
 # Tile assembly
 # ---------------------------------------------------------------------------
-def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = False) -> TileMesh:
+def _build_landmark(lm: LandmarkRecord, base_t: float, *,
+                    fetch_models: bool, sketchfab_token: str | None):
+    """Return (meshes, source_note). Tries a detailed downloaded model, else
+    falls back to extruded walls plus an optional procedural roof."""
+    # 1) Detailed model injection (Wikidata/Commons -> Sketchfab).
+    if fetch_models and (lm.qid or (lm.name and sketchfab_token)):
+        try:
+            model, source = landmark_models.fetch_landmark_mesh(lm.qid, lm.name, sketchfab_token)
+        except Exception:                # noqa: BLE001
+            model, source = None, None
+        if model is not None:
+            placed = landmark_models.fit_model(
+                model,
+                centroid_mm=lm.centroid_mm,
+                target_height_mm=lm.target_height_mm,
+                base_top_mm=base_t,
+                embed_mm=EMBED_MM,
+                max_footprint_mm=lm.max_footprint_mm * 1.6,
+            )
+            if placed is not None and len(placed.faces) > 0:
+                return [placed], f"{lm.name or lm.qid}: {source}"
+
+    # 2) Procedural fallback: extruded walls (+ roof if tagged).
+    meshes = []
+    for z_bottom, z_top, geom in lm.wall_pieces:
+        height = (z_top - z_bottom) + EMBED_MM
+        if height <= 0:
+            continue
+        wm = _extrude(geom, height, z0=base_t + z_bottom - EMBED_MM)
+        if wm is not None:
+            meshes.append(wm)
+    if lm.roof_shape and lm.roof_height_mm > 0:
+        roof = roofs.build_roof(
+            lm.footprint_mm, base_t + lm.roof_base_mm - EMBED_MM,
+            lm.roof_shape, lm.roof_height_mm + EMBED_MM, lm.roof_direction,
+        )
+        if roof is not None:
+            meshes.append(roof)
+    return meshes, None
+
+
+def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = False,
+               fetch_models: bool = False, sketchfab_token: str | None = None) -> TileMesh:
     """Assemble a single printable tile mesh from its prepared geometry."""
     base_t = tile.base_mm
     parts: list[trimesh.Trimesh] = []
+    sources: list[str] = []
 
     # --- Base plate, optionally carved with water + roads ---------------------
     base = _base_plate(tile.size_w_mm, tile.size_h_mm, base_t)
@@ -161,9 +207,7 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
         if bm is not None:
             parts.append(bm)
 
-    # --- Landmark / 3D-part pieces (stacked between z_bottom and z_top) --------
-    # Each part sinks EMBED_MM into whatever sits below it (the base for ground
-    # parts, the previous setback for upper parts) so the stack welds solidly.
+    # --- Generic 3D parts (not named landmarks): stacked z_bottom..z_top -------
     for z_bottom, z_top, geom in tile.detail_buildings:
         height = (z_top - z_bottom) + EMBED_MM
         if height <= 0:
@@ -171,6 +215,14 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
         dm = _extrude(geom, height, z0=base_t + z_bottom - EMBED_MM)
         if dm is not None:
             parts.append(dm)
+
+    # --- Named landmarks: detailed model injection or procedural fallback ------
+    for lm in tile.landmarks:
+        meshes, source = _build_landmark(
+            lm, base_t, fetch_models=fetch_models, sketchfab_token=sketchfab_token)
+        parts.extend(meshes)
+        if source:
+            sources.append(source)
 
     # --- Combine --------------------------------------------------------------
     if weld and len(parts) > 1:
@@ -184,7 +236,7 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
         mesh = trimesh.util.concatenate(parts)
 
     _finalize(mesh)
-    return TileMesh(name=tile.name, mesh=mesh)
+    return TileMesh(name=tile.name, mesh=mesh, model_sources=sources)
 
 
 def _finalize(mesh: trimesh.Trimesh) -> None:
@@ -202,6 +254,11 @@ def _finalize(mesh: trimesh.Trimesh) -> None:
     mesh.apply_translation([-cx, -cy, -minz])
 
 
-def build_all(tiles: list[TileGeom], *, carve_features: bool = True, weld: bool = False) -> list[TileMesh]:
+def build_all(tiles: list[TileGeom], *, carve_features: bool = True, weld: bool = False,
+              fetch_models: bool = False, sketchfab_token: str | None = None) -> list[TileMesh]:
     """Build every tile in a preset (1 tile normally, 4 for the Tier-3 mega map)."""
-    return [build_tile(t, carve_features=carve_features, weld=weld) for t in tiles]
+    return [
+        build_tile(t, carve_features=carve_features, weld=weld,
+                   fetch_models=fetch_models, sketchfab_token=sketchfab_token)
+        for t in tiles
+    ]

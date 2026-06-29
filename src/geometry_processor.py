@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import math
 import random
+import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 import geopandas as gpd
@@ -37,6 +39,7 @@ from shapely.affinity import translate as shp_translate
 from shapely.geometry import box
 from shapely.ops import unary_union
 
+from src import roofs
 from src.osm_fetcher import MapData
 
 # ---------------------------------------------------------------------------
@@ -60,6 +63,14 @@ LANDMARK_BUILDING_VALUES = {
 }
 LANDMARK_NAMED_HEIGHT_M = 60.0    # a *named* building this tall is a landmark
 LANDMARK_ANY_HEIGHT_M = 120.0     # anything this tall is a landmark regardless
+
+# Default share of a building's printed height given to its roof when the OSM
+# roof:height tag is missing, keyed by roof shape.
+DEFAULT_ROOF_FRAC = {
+    "spire": 0.55, "pyramidal": 0.5, "cone": 0.5, "round": 0.5,
+    "dome": 0.4, "onion": 0.45,
+    "gabled": 0.35, "pitched": 0.35, "hipped": 0.3, "skillion": 0.3,
+}
 
 # Detail Level presets. ``use_parts`` enables Simple-3D-Buildings detail;
 # ``simplify_*`` are shapely tolerances in metres (0 = no simplification).
@@ -99,6 +110,32 @@ WATERWAY_WIDTH_DEFAULT_M = 6.0
 
 
 # ---------------------------------------------------------------------------
+# A named landmark, grouped for detailed-model injection (built per tile)
+# ---------------------------------------------------------------------------
+@dataclass
+class LandmarkRecord:
+    """One landmark we'll try to render with a detailed downloaded model.
+
+    All geometry is in tile millimetre space. If no model is found, the caller
+    falls back to ``wall_pieces`` (extruded footprints) plus an optional
+    procedural ``roof``.
+    """
+
+    key: str
+    name: str | None
+    qid: str | None
+    centroid_mm: tuple[float, float]
+    target_height_mm: float                 # full printed height (for model scaling)
+    max_footprint_mm: float                 # real footprint extent (clamps model width)
+    footprint_mm: object                    # shapely geometry (union of the group)
+    wall_pieces: list[tuple[float, float, object]] = field(default_factory=list)
+    roof_shape: str | None = None
+    roof_base_mm: float = 0.0               # z (above base top) where the roof starts
+    roof_height_mm: float = 0.0
+    roof_direction: float | None = None
+
+
+# ---------------------------------------------------------------------------
 # Output container — one per printed STL tile
 # ---------------------------------------------------------------------------
 @dataclass
@@ -111,8 +148,10 @@ class TileGeom:
     base_mm: float
     # Ordinary buildings: (height_mm, geometry), footprints unioned per height bin.
     building_bins: list[tuple[float, object]] = field(default_factory=list)
-    # Landmarks / 3D parts: (z_bottom_mm, z_top_mm, geometry), extruded individually.
+    # Generic 3D parts (not a named landmark): (z_bottom_mm, z_top_mm, geometry).
     detail_buildings: list[tuple[float, float, object]] = field(default_factory=list)
+    # Named landmarks grouped for detailed-model injection / roof reconstruction.
+    landmarks: list[LandmarkRecord] = field(default_factory=list)
     water: object | None = None
     roads: object | None = None
     parks: object | None = None
@@ -123,7 +162,11 @@ class TileGeom:
 
     @property
     def detail_count(self) -> int:
-        return len(self.detail_buildings)
+        return len(self.detail_buildings) + sum(len(lm.wall_pieces) for lm in self.landmarks)
+
+    @property
+    def landmark_count(self) -> int:
+        return len(self.landmarks)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +204,32 @@ def _truthy(value) -> bool:
 
 def _get(row, key):
     return row[key] if key in row.index else None
+
+
+def _first(value):
+    """OSM tags can arrive as a list when an element has multiple values."""
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def wikidata_qid(value) -> str | None:
+    """Extract a Wikidata Q-id (e.g. 'Q243') from an OSM ``wikidata`` tag."""
+    value = _first(value)
+    if not _truthy(value):
+        return None
+    match = re.search(r"Q\d+", str(value))
+    return match.group(0) if match else None
+
+
+def clean_name(value) -> str | None:
+    value = _first(value)
+    return str(value).strip() if _truthy(value) else None
+
+
+def roof_shape_of(value) -> str | None:
+    value = _first(value)
+    return str(value).strip().lower() if _truthy(value) else None
 
 
 def building_z_range(row, rng: random.Random) -> tuple[float, float]:
@@ -287,63 +356,139 @@ def _crop(geom, tile_box):
 # ---------------------------------------------------------------------------
 # Building classification: bulk prisms vs detailed landmark/part pieces
 # ---------------------------------------------------------------------------
-def _classify_buildings(buildings: gpd.GeoDataFrame, level: dict, seed: int):
-    """Split buildings into (bulk_gdf, detail_gdf).
+def _landmark_key(qid, name, fallback: str) -> str:
+    """NaN/None-safe landmark group key (a bare ``x or y`` mishandles float NaN)."""
+    if _truthy(qid):
+        return str(qid)
+    if _truthy(name):
+        return f"name:{name}"
+    return fallback
 
-    bulk_gdf   : ordinary footprints -> binned/unioned simple prisms. Carries a
-                 ``height_m`` column.
-    detail_gdf : landmarks + 3D parts -> extruded individually with full detail.
-                 Carries ``zb_m`` / ``zt_m`` columns.
-    """
+
+def _roof_frac(shape, roof_h_m, total_m) -> float:
+    """Fraction of a building's height occupied by its roof."""
+    if not shape or shape not in roofs.SUPPORTED_SHAPES:
+        return 0.0
+    if roof_h_m and total_m and total_m > 0:
+        return max(0.05, min(0.7, roof_h_m / total_m))
+    return DEFAULT_ROOF_FRAC.get(shape, 0.35)
+
+
+def _annotate(buildings: gpd.GeoDataFrame, level: dict, seed: int) -> gpd.GeoDataFrame:
+    """Add per-row geometry/identity/height columns used by all later stages."""
     rng = random.Random(seed)
-    use_parts = level["use_parts"]
     want_landmarks = level["landmarks"]
+    work = buildings.copy()
 
-    is_part, is_outline, zb, zt, landmark = [], [], [], [], []
-    for _, row in buildings.iterrows():
+    cols = {k: [] for k in (
+        "_is_part", "_is_outline", "zb_m", "zt_m", "_landmark",
+        "lm_qid", "lm_name", "roof_shape", "roof_height_m", "roof_dir", "roof_frac",
+    )}
+    for _, row in work.iterrows():
         part = _truthy(_get(row, "building:part")) and not _truthy(_get(row, "building"))
         outline = _truthy(_get(row, "building"))
         b, t = building_z_range(row, rng)
-        is_part.append(part)
-        is_outline.append(outline or not part)   # treat ambiguous rows as outlines
-        zb.append(b)
-        zt.append(t)
-        landmark.append(want_landmarks and is_landmark(row, t))
+        shape = roof_shape_of(_get(row, "roof:shape"))
+        rh = _parse_float(_get(row, "roof:height"))
+        cols["_is_part"].append(part)
+        cols["_is_outline"].append(outline or not part)
+        cols["zb_m"].append(b)
+        cols["zt_m"].append(t)
+        cols["_landmark"].append(want_landmarks and is_landmark(row, t))
+        cols["lm_qid"].append(wikidata_qid(_get(row, "wikidata")))
+        cols["lm_name"].append(clean_name(_get(row, "name")))
+        cols["roof_shape"].append(shape)
+        cols["roof_height_m"].append(rh)
+        cols["roof_dir"].append(_parse_float(_get(row, "roof:direction")))
+        cols["roof_frac"].append(_roof_frac(shape, rh, t))
+    for k, v in cols.items():
+        work[k] = v
+    return work
 
-    work = buildings.copy()
-    work["_is_part"] = is_part
-    work["_is_outline"] = is_outline
-    work["zb_m"] = zb
-    work["zt_m"] = zt
-    work["_landmark"] = landmark
 
+def _classify_buildings(buildings: gpd.GeoDataFrame, level: dict, seed: int):
+    """Split buildings into (bulk_gdf, detail_gdf).
+
+    bulk_gdf   : ordinary footprints -> binned simple prisms (``height_m``).
+    detail_gdf : landmarks + 3D parts -> kept individually, tagged with a landmark
+                 group key (``lm_key``), the group's real top height
+                 (``cluster_h_m``) and inherited identity/roof columns so a tower's
+                 wikidata id survives even when its outline is covered by parts.
+    """
+    work = _annotate(buildings, level, seed)
     parts = work[work["_is_part"]]
     outlines = work[work["_is_outline"]]
 
-    if not use_parts:
-        # Ignore 3D parts entirely; every outline is a bulk prism.
+    if not level["use_parts"]:
         bulk = outlines.copy()
         bulk["height_m"] = bulk["zt_m"]
-        detail = work.iloc[0:0].copy()
-        return bulk, detail
+        return bulk, work.iloc[0:0].copy()
 
-    # Detail mode: drop outlines that are covered by parts (avoid double walls).
-    kept_outlines = outlines
-    if not parts.empty and not outlines.empty:
+    cluster_h = work["zt_m"].astype(float).copy()
+    lm_key = pd.Series([None] * len(work), index=work.index, dtype=object)
+
+    # Each landmark outline is its own group.
+    for idx, row in outlines.iterrows():
+        if row["_landmark"]:
+            lm_key[idx] = _landmark_key(row["lm_qid"], row["lm_name"], f"idx:{idx}")
+
+    # Cluster parts into connected structures; transfer identity from any
+    # overlapping landmark outline (covered or not) and record which outlines
+    # are covered (so they drop out of the bulk layer).
+    covered: set = set()
+    if not parts.empty:
         try:
-            joined = gpd.sjoin(outlines, parts[["geometry"]], predicate="intersects", how="left")
-            covered = joined.index[joined["index_right"].notna()].unique()
-            kept_outlines = outlines.drop(index=covered)
-        except Exception:  # noqa: BLE001 - spatial join hiccup -> keep all outlines
-            kept_outlines = outlines
+            merged = unary_union(list(parts.geometry.values))
+            clusters = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+            cgdf = gpd.GeoDataFrame({"cid": range(len(clusters))}, geometry=clusters, crs=parts.crs)
+            pts = parts.copy()
+            pts.set_geometry(parts.geometry.representative_point(), inplace=True)
+            joined = gpd.sjoin(pts, cgdf, predicate="within", how="left")
+            cid_parts = defaultdict(list)
+            for pidx, crow in joined.iterrows():
+                cid_parts[crow["index_right"]].append(pidx)
+        except Exception:  # noqa: BLE001 - clustering failed: one big group
+            clusters = [None]
+            cid_parts = {0: list(parts.index)}
 
-    landmark_outlines = kept_outlines[kept_outlines["_landmark"]]
-    bulk_outlines = kept_outlines[~kept_outlines["_landmark"]]
+        for cid, pidxs in cid_parts.items():
+            try:
+                cl_geom = clusters[int(cid)]
+            except (TypeError, ValueError, IndexError):
+                cl_geom = unary_union([work.loc[i, "geometry"] for i in pidxs])
+            h_real = max(float(work.loc[i, "zt_m"]) for i in pidxs)
 
-    detail = pd.concat([parts, landmark_outlines])
-    detail = gpd.GeoDataFrame(detail, geometry="geometry", crs=buildings.crs)
+            cand = outlines[outlines.intersects(cl_geom)] if cl_geom is not None else outlines.iloc[0:0]
+            covered.update(cand.index.tolist())
+            lm_cand = cand[cand["_landmark"]]
+            chosen = lm_cand.iloc[0] if not lm_cand.empty else None
+            key = None
+            if chosen is not None:
+                key = _landmark_key(chosen["lm_qid"], chosen["lm_name"], f"cid:{cid}")
+                h_real = max(h_real, float(chosen["zt_m"]))
 
-    bulk = bulk_outlines.copy()
+            for i in pidxs:
+                cluster_h[i] = h_real
+                if key is not None:
+                    lm_key[i] = key
+                    work.at[i, "lm_qid"] = chosen["lm_qid"]
+                    work.at[i, "lm_name"] = chosen["lm_name"]
+                    work.at[i, "roof_shape"] = chosen["roof_shape"]
+                    work.at[i, "roof_height_m"] = chosen["roof_height_m"]
+                    work.at[i, "roof_dir"] = chosen["roof_dir"]
+                    work.at[i, "roof_frac"] = chosen["roof_frac"]
+
+    work["cluster_h_m"] = cluster_h
+    work["lm_key"] = lm_key
+
+    # Re-derive the layers from `work` *after* the new columns exist, so detail
+    # rows carry lm_key / cluster_h_m / inherited identity.
+    covered_mask = work.index.isin(covered)
+    detail_mask = work["_is_part"] | (work["_is_outline"] & work["_landmark"] & ~covered_mask)
+    bulk_mask = work["_is_outline"] & ~work["_landmark"] & ~covered_mask
+
+    detail = gpd.GeoDataFrame(work[detail_mask].copy(), geometry="geometry", crs=buildings.crs)
+    bulk = work[bulk_mask].copy()
     bulk["height_m"] = bulk["zt_m"]
     return bulk, detail
 
@@ -439,7 +584,9 @@ def prepare_tiles(
             if detail is not None and not detail.empty:
                 in_tile = gpd.clip(detail, tile_box)
                 in_tile = in_tile[in_tile.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-                tile.detail_buildings = _detail_pieces(in_tile, tcx, tcy, scale, detail_mult, max_height_mm)
+                generic, records = _build_tile_detail(in_tile, tcx, tcy, scale)
+                tile.detail_buildings = generic
+                tile.landmarks = records
 
             results.append(tile)
 
@@ -470,67 +617,98 @@ def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_heigh
 def _assign_detail_heights(detail: gpd.GeoDataFrame, mult: float, scale: float, cap: float):
     """Add printed ``pz_b`` / ``pz_t`` (mm) columns to landmark/part features.
 
-    A landmark's overall top is soft-capped to the printable ceiling, but its
-    internal 3D parts are then scaled *proportionally to that landmark's own real
-    height*. That keeps the tapered silhouette (setbacks, spire) intact instead
-    of letting ``tanh`` saturation flatten every upper part to the same level.
-
-    Parts are grouped into landmarks by connected (overlapping) footprints.
+    A landmark's overall top is soft-capped to the printable ceiling, but each of
+    its 3D parts is then scaled *proportionally to that landmark's own real height*
+    (``cluster_h_m``). That keeps the tapered silhouette (setbacks, spire) intact
+    instead of letting ``tanh`` saturation flatten every upper part to one level.
     """
     detail = detail.copy()
     pz_b = pd.Series(0.0, index=detail.index)
     pz_t = pd.Series(0.0, index=detail.index)
-
-    parts = detail[detail["_is_part"]]
-    outlines = detail[~detail["_is_part"]]
-
-    # Landmark outlines without 3D parts: a single capped prism from the ground.
-    for idx, row in outlines.iterrows():
-        pz_t[idx] = _soft_cap(row["zt_m"] * mult * scale, cap)
-
-    if not parts.empty:
-        try:
-            merged = unary_union(list(parts.geometry.values))
-            clusters = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
-            cgdf = gpd.GeoDataFrame({"cid": range(len(clusters))}, geometry=clusters, crs=parts.crs)
-            pts = parts.copy()
-            pts.set_geometry(parts.geometry.representative_point(), inplace=True)
-            joined = gpd.sjoin(pts, cgdf, predicate="within", how="left")
-            groups = joined.groupby("index_right")
-        except Exception:  # noqa: BLE001 - clustering failed; cap each part on its own
-            groups = [(None, parts)]
-
-        for _cid, grp in groups:
-            idxs = list(grp.index)
-            h_real = max(float(parts.loc[i, "zt_m"]) for i in idxs)
-            if h_real <= 0:
-                continue
-            target = _soft_cap(h_real * mult * scale, cap)   # printed mm for the top
-            for i in idxs:
-                pz_t[i] = target * (float(parts.loc[i, "zt_m"]) / h_real)
-                pz_b[i] = target * (max(0.0, float(parts.loc[i, "zb_m"])) / h_real)
-
+    for idx, row in detail.iterrows():
+        h_real = float(row.get("cluster_h_m") or 0.0) or float(row["zt_m"]) or 1.0
+        target = _soft_cap(h_real * mult * scale, cap)
+        pz_t[idx] = target * (float(row["zt_m"]) / h_real)
+        pz_b[idx] = target * (max(0.0, float(row["zb_m"])) / h_real)
     detail["pz_b"] = pz_b
     detail["pz_t"] = pz_t
     return detail
 
 
-def _detail_pieces(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, mult, max_height_mm):
-    """Each landmark/part kept individually as (z_bottom_mm, z_top_mm, geom).
+def _build_tile_detail(in_tile: gpd.GeoDataFrame, tcx, tcy, scale):
+    """Split cropped detail rows into generic part-pieces and landmark records.
 
-    Printed heights were pre-computed per landmark in ``_assign_detail_heights``
-    (so the taper is preserved); here we just read them and place the geometry.
+    Returns (generic_pieces, landmark_records) where generic_pieces is a list of
+    ``(z_bottom_mm, z_top_mm, geom)`` and landmark_records is a list of
+    ``LandmarkRecord`` (walls + optional procedural roof, ready for model injection).
     """
     if in_tile.empty:
-        return []
-    out = []
+        return [], []
+
+    generic: list[tuple[float, float, object]] = []
+    groups: dict[str, dict] = {}
     for _, row in in_tile.iterrows():
         geom = _to_tile_mm(row.geometry, tcx, tcy, scale)
         if geom is None:
             continue
-        zb = max(0.0, float(row["pz_b"])) if "pz_b" in row.index else 0.0
-        zt = float(row["pz_t"]) if "pz_t" in row.index else _soft_cap(row["zt_m"] * mult * scale, max_height_mm)
+        zb = max(0.0, float(row.get("pz_b", 0.0)))
+        zt = float(row.get("pz_t", 0.0))
         if zt - zb < MIN_PART_MM:
             zt = zb + MIN_PART_MM
-        out.append((zb, zt, geom))
-    return out
+
+        key = row.get("lm_key")
+        if key is None or (isinstance(key, float) and pd.isna(key)):
+            generic.append((zb, zt, geom))
+            continue
+
+        g = groups.get(key)
+        if g is None:
+            qid = row.get("lm_qid")
+            name = row.get("lm_name")
+            shape = row.get("roof_shape")
+            g = {"geoms": [], "pieces": [], "zt_max": 0.0, "n": 0,
+                 "qid": str(qid) if _truthy(qid) else None,
+                 "name": str(name) if _truthy(name) else None,
+                 "roof_shape": str(shape) if _truthy(shape) else None,
+                 "roof_frac": float(row.get("roof_frac") or 0.0),
+                 "roof_dir": row.get("roof_dir")}
+            groups[key] = g
+        g["geoms"].append(geom)
+        g["pieces"].append((zb, zt, geom))
+        g["zt_max"] = max(g["zt_max"], zt)
+        g["n"] += 1
+
+    records: list[LandmarkRecord] = []
+    for key, g in groups.items():
+        footprint = _only_polygons(unary_union(g["geoms"]))
+        if footprint is None or footprint.is_empty:
+            continue
+        minx, miny, maxx, maxy = footprint.bounds
+        centroid = footprint.centroid
+        height = g["zt_max"]
+
+        wall_pieces = g["pieces"]
+        roof_shape = None
+        roof_base = roof_h = 0.0
+        roof_dir = g["roof_dir"]
+        # Procedural roof only for single-footprint landmarks (e.g. a domed
+        # cathedral) — towers built from stacked parts model their own top.
+        frac = g["roof_frac"]
+        if g["n"] == 1 and g["roof_shape"] and frac > 0:
+            zb0, zt0, geom0 = g["pieces"][0]
+            wall_top = zb0 + (zt0 - zb0) * (1.0 - frac)
+            wall_pieces = [(zb0, wall_top, geom0)]
+            roof_shape = g["roof_shape"]
+            roof_base = wall_top
+            roof_h = zt0 - wall_top
+
+        records.append(LandmarkRecord(
+            key=str(key), name=g["name"], qid=g["qid"],
+            centroid_mm=(float(centroid.x), float(centroid.y)),
+            target_height_mm=float(height),
+            max_footprint_mm=float(max(maxx - minx, maxy - miny)),
+            footprint_mm=footprint, wall_pieces=wall_pieces,
+            roof_shape=roof_shape, roof_base_mm=float(roof_base),
+            roof_height_mm=float(roof_h), roof_direction=roof_dir,
+        ))
+    return generic, records

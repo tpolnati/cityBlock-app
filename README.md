@@ -97,19 +97,53 @@ The **Landmark emphasis ×** slider adds extra height to landmarks/parts so they
 tower further above the city; **Max relief height** caps the tallest feature so
 prints stay sensible. Changing any of these recomputes the mesh only — no refetch.
 
+### Detailed landmark models (recognisable icons)
+
+OSM extrusion alone can't make the Burj Khalifa *look* like the Burj Khalifa. Turn
+on **"Fetch real 3D models for landmarks"** and the app downloads a genuinely
+detailed model for each detected landmark and stitches it into the city at the
+right place and a printable height. Sources are tried best-first:
+
+1. **Wikidata `P4896` → Wikimedia Commons STL.** OSM tags landmarks with
+   `wikidata=Q…`; that entity often links a free, CC-licensed, print-ready STL
+   (Eiffel Tower, Statue of Liberty, Parthenon…). No key needed.
+2. **Sketchfab** *(optional — paste a free API token)*. Far broader coverage,
+   including skyscrapers like the Burj Khalifa. Only **downloadable, CC-licensed**
+   models are used. Get a token at `sketchfab.com/settings/password` → API.
+3. **Procedural fallback** — if no model is found, the landmark still renders from
+   its OSM `building:part` massing plus a reconstructed roof (dome/spire/…), which
+   is already far more recognisable than a flat box.
+
+A fetched model is oriented Z-up, uniformly scaled to the landmark's printable
+height, and placed at its footprint centroid. Downloads are cached, so re-exports
+don't re-fetch. The export panel lists which landmarks got a detailed model and
+from where.
+
+> **Coverage & expectations.** No free dataset has detailed printable models for
+> *every* landmark on Earth. Wikidata/Commons is exact but sparse; Sketchfab is
+> broad but needs a token and its models vary in quality/scale. Where neither has
+> a model, the procedural roof/massing fallback keeps the building recognisable.
+> Model fetching is **opt-in** because it hits external services and is slower —
+> but there's no time limit on export, so leave it on for hero pieces.
+
 ## Project structure
 
 ```
 app.py                       Streamlit UI, session state, preset logic, fetch + export flow
 src/
   osm_fetcher.py             OSM retrieval, validation, dynamic UTM projection (cached)
-  geometry_processor.py      shapely/geopandas: crop, union, buffer, simplify, tile, scale → mm
-  mesh_generator.py          trimesh: base plate, extrusion, carving, weld, centering, STL export
+  geometry_processor.py      shapely/geopandas: crop, union, buffer, simplify, landmark
+                             grouping, tiling, scale → mm
+  landmark_models.py         Wikidata/Commons + Sketchfab model resolver + stitching (cached)
+  roofs.py                   procedural roof solids (dome, spire, pyramidal, gabled, hipped…)
+  mesh_generator.py          trimesh: base plate, extrusion, carving, model injection,
+                             weld, centering, STL export
 requirements.txt
 ```
 
-The fetch layer is the **only** code that touches the network and is wrapped in
-`@st.cache_data`, keyed purely on `(lat, lon, radius)`.
+The OSM fetch layer is wrapped in `@st.cache_data` keyed on `(lat, lon, radius)`;
+landmark-model downloads are cached separately by Wikidata id / name. Toggling
+detail, height or model options recomputes the mesh only — never the OSM data.
 
 ---
 
@@ -150,4 +184,4 @@ The fetch layer is the **only** code that touches the network and is wrapped in
 ## Tech stack
 
 Streamlit · osmnx · geopandas · shapely · pyproj · trimesh · manifold3d ·
-mapbox-earcut · matplotlib
+mapbox-earcut · requests (Wikidata/Commons/Sketchfab) · matplotlib

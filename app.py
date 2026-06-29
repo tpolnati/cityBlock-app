@@ -77,6 +77,7 @@ def _init_state() -> None:
         "fetch_error": None,       # str | None
         "generated": None,         # list[dict] of exported tiles, or None
         "gen_caption": "",         # human-readable description of last generation
+        "model_sources": [],       # notes on landmarks rendered from downloaded models
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -130,9 +131,12 @@ def _render_tile_preview(tile: geometry_processor.TileGeom) -> None:
     _plot_polys(ax, tile.roads, color="#888888", alpha=0.8, linewidth=0)
     for _h, geom in tile.building_bins:
         _plot_polys(ax, geom, color="#2b2b2b", linewidth=0)
-    # Landmarks / 3D parts highlighted in gold so attractions stand out.
+    # Generic 3D parts in a mid tone.
     for _zb, _zt, geom in tile.detail_buildings:
-        _plot_polys(ax, geom, color="#d4a017", alpha=0.95, linewidth=0)
+        _plot_polys(ax, geom, color="#6a6a6a", alpha=0.9, linewidth=0)
+    # Named landmarks highlighted in gold so attractions stand out.
+    for lm in tile.landmarks:
+        _plot_polys(ax, lm.footprint_mm, color="#d4a017", alpha=0.97, linewidth=0)
     ax.set_aspect("equal")
     ax.set_xlim(-half_w * 1.05, half_w * 1.05)
     ax.set_ylim(-half_h * 1.05, half_h * 1.05)
@@ -329,6 +333,22 @@ def main() -> None:
         inc_water = feat[0].checkbox("Water", value=True)
         inc_roads = feat[1].checkbox("Roads", value=True)
         inc_parks = feat[2].checkbox("Parks", value=True)
+
+        st.markdown("**Detailed landmark models**")
+        fetch_models = st.checkbox(
+            "Fetch real 3D models for landmarks (online, slower)", value=False,
+            help="Downloads detailed, recognisable models for famous landmarks and "
+                 "stitches them in: Wikidata/Wikimedia Commons first (free), then "
+                 "Sketchfab if a token is provided. Falls back to procedural roofs "
+                 "and massing when no model is found.",
+        )
+        sketchfab_token = st.text_input(
+            "Sketchfab API token (optional)", value="", type="password",
+            help="Free token from sketchfab.com/settings/password → API. Greatly "
+                 "widens coverage (e.g. skyscrapers like the Burj Khalifa). Only "
+                 "CC-licensed, downloadable models are used.",
+            disabled=not fetch_models,
+        ).strip() or None
         generate = st.button("🧱 Generate STL(s)", type="primary", use_container_width=True)
 
     if generate:
@@ -343,24 +363,33 @@ def main() -> None:
                     include_roads=inc_roads,
                     include_parks=inc_parks,
                 )
-            with st.spinner(f"Extruding {len(tiles)} tile(s) and exporting STL…"):
-                meshes = mesh_generator.build_all(tiles, carve_features=carve, weld=weld)
+            spin = "Extruding {n} tile(s), fetching landmark models, exporting STL…" if fetch_models \
+                else "Extruding {n} tile(s) and exporting STL…"
+            with st.spinner(spin.format(n=len(tiles))):
+                meshes = mesh_generator.build_all(
+                    tiles, carve_features=carve, weld=weld,
+                    fetch_models=fetch_models, sketchfab_token=sketchfab_token,
+                )
 
             stem = _slugify(st.session_state["last_query"])
             generated = []
+            all_sources = []
             for tg, tm in zip(tiles, meshes):
                 dims = tm.dims_mm
+                all_sources.extend(tm.model_sources)
                 generated.append({
                     "name": tm.name,
                     "filename": f"luminamap_{stem}_{tm.name}.stl",
                     "bytes": tm.to_stl_bytes(),
                     "triangles": tm.triangles,
                     "watertight": tm.watertight,
-                    "landmarks": tg.detail_count,
+                    "landmarks": tg.landmark_count,
+                    "model_sources": tm.model_sources,
                     "dims": (round(dims[0], 1), round(dims[1], 1), round(dims[2], 1)),
                     "preview": tg,
                 })
             st.session_state["generated"] = generated
+            st.session_state["model_sources"] = all_sources
             emph = f" · landmarks ×{landmark_emphasis:g}" if landmark_emphasis != 1.0 else ""
             st.session_state["gen_caption"] = (
                 f"{preset_name} · Z×{z_mult:g} · {detail_level} detail{emph} · "
@@ -382,6 +411,12 @@ def main() -> None:
             if len(generated) > 1:
                 st.caption(f"Preview shows {generated[0]['name']} of {len(generated)} tiles.")
 
+        sources = st.session_state["model_sources"] or []
+        if sources:
+            st.markdown("**Detailed models stitched in:**")
+            for src in sources:
+                st.markdown(f"- 🏛️ {src}")
+
         st.subheader("Export")
         cols = st.columns(min(len(generated), 4))
         for idx, item in enumerate(generated):
@@ -389,7 +424,12 @@ def main() -> None:
             with col:
                 wt = "✅ watertight" if item["watertight"] else "⚠️ not watertight"
                 w, h, t = item["dims"]
-                lm = f"  \n⭐ {item['landmarks']} landmark/3D pieces" if item.get("landmarks") else ""
+                n_models = len(item.get("model_sources") or [])
+                lm = ""
+                if item.get("landmarks"):
+                    lm = f"  \n⭐ {item['landmarks']} landmark(s)"
+                    if n_models:
+                        lm += f", {n_models} detailed model(s)"
                 st.markdown(
                     f"**{item['name']}**  \n"
                     f"{w} × {h} × {t} mm  \n"
