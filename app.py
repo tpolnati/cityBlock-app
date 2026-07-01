@@ -19,7 +19,7 @@ import re
 import matplotlib.pyplot as plt
 import streamlit as st
 
-from src import geometry_processor, mesh_generator, osm_fetcher
+from src import geometry_processor, mesh_generator, osm_fetcher, terrain
 
 # ---------------------------------------------------------------------------
 # Preset system
@@ -323,7 +323,26 @@ def main() -> None:
                  "height (so an 800 m tower won't print a metre tall) while small "
                  "buildings stay near true-to-scale.",
         )
-        carve = st.checkbox("Carve water/roads into base", value=True)
+        st.markdown("**Terrain (elevation)**")
+        terrain_on = st.checkbox(
+            "Add real terrain / elevation (online)", value=False,
+            help="Downloads a Digital Elevation Model and builds a topographic "
+                 "base with buildings draped onto the hills. Great for hilly "
+                 "cities; off by default (a flat base backlights more evenly).",
+        )
+        terrain_exagg = st.slider(
+            "Terrain exaggeration ×", min_value=0.5, max_value=5.0, value=2.0, step=0.5,
+            help="Real relief is subtle at map scale — exaggerate it to make hills read.",
+            disabled=not terrain_on,
+        )
+        terrain_cap = st.slider(
+            "Max terrain relief (mm)", min_value=5.0, max_value=60.0, value=25.0, step=5.0,
+            help="Caps how tall the hills print above the base plate.",
+            disabled=not terrain_on,
+        )
+
+        carve = st.checkbox("Carve water/roads into base", value=True,
+                            help="Ignored when terrain is on (features drape on the surface).")
         weld = st.checkbox(
             "Weld into single manifold (boolean union — slower)", value=False,
             help="Off: fast concatenation (buildings embedded into the base, "
@@ -353,12 +372,24 @@ def main() -> None:
 
     if generate:
         try:
+            dem = None
+            if terrain_on:
+                with st.spinner("Fetching elevation data (DEM)…"):
+                    dem = terrain.fetch_terrain(md.center_latlon, md.radius_m, md.utm_crs)
+                if dem is None:
+                    st.warning(
+                        "Couldn't fetch elevation data (network/API). Building a "
+                        "flat base instead."
+                    )
             with st.spinner("Processing 2D geometry (crop, union, buffer, simplify)…"):
                 tiles = geometry_processor.prepare_tiles(
                     md, preset, z_mult,
                     detail_level=detail_level,
                     landmark_emphasis=landmark_emphasis,
                     max_height_mm=max_height_mm,
+                    terrain=dem,
+                    terrain_exaggeration=terrain_exagg,
+                    terrain_cap_mm=terrain_cap,
                     include_water=inc_water,
                     include_roads=inc_roads,
                     include_parks=inc_parks,
@@ -391,10 +422,11 @@ def main() -> None:
             st.session_state["generated"] = generated
             st.session_state["model_sources"] = all_sources
             emph = f" · landmarks ×{landmark_emphasis:g}" if landmark_emphasis != 1.0 else ""
+            terr = f" · terrain ×{terrain_exagg:g}" if (terrain_on and dem is not None) else ""
             st.session_state["gen_caption"] = (
-                f"{preset_name} · Z×{z_mult:g} · {detail_level} detail{emph} · "
+                f"{preset_name} · Z×{z_mult:g} · {detail_level} detail{emph}{terr} · "
                 f"{'welded' if weld else 'concatenated'}"
-                f"{' · carved' if carve else ''}"
+                f"{'' if (terrain_on and dem is not None) else (' · carved' if carve else '')}"
             )
         except Exception as exc:  # noqa: BLE001 - surface a clean error in the UI
             st.session_state["generated"] = None

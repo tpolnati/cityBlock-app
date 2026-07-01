@@ -50,14 +50,18 @@ def _apex_roof(poly, z0: float, height: float, apex_xy=None) -> trimesh.Trimesh 
     verts = np.asarray(verts, dtype=float)
 
     faces = [[i, (i + 1) % n, n] for i in range(n)]  # sides -> apex
-    # Bottom cap (triangulate the base polygon) so the solid is closed.
+    verts = list(verts)
+    # Bottom cap: triangulate the base polygon (merge_vertices later welds the
+    # duplicated z0 ring vertices, keeping the solid watertight).
     try:
-        f2d, _ = trimesh.creation.triangulate_polygon(Polygon(ring), engine="earcut")
-        faces.extend([[int(b), int(a), int(c)] for a, b, c in f2d])  # flip for downward normal
-    except Exception:  # noqa: BLE001 - fan cap as fallback
+        v2d, f2d = trimesh.creation.triangulate_polygon(Polygon(ring), engine="earcut")
+        off = len(verts)
+        verts.extend([[float(x), float(y), z0] for x, y in v2d])
+        faces.extend([[off + int(b), off + int(a), off + int(c)] for a, b, c in f2d])
+    except Exception:  # noqa: BLE001 - fan cap fallback (fine for convex footprints)
         faces.extend([[0, (i + 1), i] for i in range(1, n - 1)])
 
-    return _finish(verts, faces)
+    return _finish(np.asarray(verts, dtype=float), faces)
 
 
 def _dome_roof(poly, z0: float, height: float, onion: bool = False) -> trimesh.Trimesh | None:

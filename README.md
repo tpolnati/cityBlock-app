@@ -126,18 +126,39 @@ from where.
 > Model fetching is **opt-in** because it hits external services and is slower —
 > but there's no time limit on export, so leave it on for hero pieces.
 
+### Terrain / elevation
+
+By default the ground is flat (which backlights most evenly). Turn on **"Add
+real terrain / elevation"** and the app downloads a Digital Elevation Model,
+builds a **topographic base**, and **drapes the city onto the hills** — so
+places like San Francisco, Rome or Lisbon actually read as hilly.
+
+- **Data:** sampled on a grid from a public elevation API (OpenTopoData SRTM
+  30 m, then Open-Elevation as fallback) — no key, cached.
+- **Draping:** each building/landmark sits on the ground height at its footprint;
+  water, roads and parks are laid as thin layers that follow the surface.
+- **Controls:** **Terrain exaggeration ×** (real relief is subtle at map scale)
+  and **Max terrain relief (mm)** to keep prints sensible. The lowest ground
+  still keeps a solid base thickness, and the result stays watertight.
+- **Tiling:** the Tier-3 mega map samples terrain at exact tile edges, so the
+  four tiles line up seamlessly.
+- **Note:** with terrain on, water/roads drape on the surface instead of being
+  carved into a flat base, and the base is uneven — worth considering for the
+  backlit tiers. It's **opt-in** and off by default.
+
 ## Project structure
 
 ```
 app.py                       Streamlit UI, session state, preset logic, fetch + export flow
 src/
   osm_fetcher.py             OSM retrieval, validation, dynamic UTM projection (cached)
+  terrain.py                 DEM fetch (elevation API) + per-tile heightmap (cached)
   geometry_processor.py      shapely/geopandas: crop, union, buffer, simplify, landmark
-                             grouping, tiling, scale → mm
+                             grouping, tiling, terrain draping, scale → mm
   landmark_models.py         Wikidata/Commons + Sketchfab model resolver + stitching (cached)
   roofs.py                   procedural roof solids (dome, spire, pyramidal, gabled, hipped…)
-  mesh_generator.py          trimesh: base plate, extrusion, carving, model injection,
-                             weld, centering, STL export
+  mesh_generator.py          trimesh: base/terrain solid, extrusion, carving, draping,
+                             model injection, weld, centering, STL export
 requirements.txt
 ```
 
@@ -173,6 +194,8 @@ detail, height or model options recomputes the mesh only — never the OSM data.
 | Detail-level simplify tolerances | `geometry_processor.DETAIL_LEVELS` | 0.0–0.30 m |
 | Max relief height (cap) | `geometry_processor.DEFAULT_MAX_HEIGHT_MM` | 50 mm |
 | Landmark height thresholds | `geometry_processor.LANDMARK_*_HEIGHT_M` | 60 / 120 m |
+| Terrain exaggeration / cap | `geometry_processor.DEFAULT_TERRAIN_EXAGG / _CAP_MM` | 2.0× / 25 mm |
+| Terrain grid / tile resolution | `terrain.fetch_terrain grid_n`, `TERRAIN_TILE_RES` | 56 / 48 |
 | Height bin size | `geometry_processor.HEIGHT_BIN_MM` | 0.5 mm |
 | Road / waterway widths | `geometry_processor.ROAD_WIDTH_M / WATERWAY_WIDTH_M` | by OSM class |
 | Carve depth | `mesh_generator.CARVE_MAX_MM` | 1.2 mm |

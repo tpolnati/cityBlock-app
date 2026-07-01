@@ -26,6 +26,7 @@ import trimesh
 
 from src import landmark_models, roofs
 from src.geometry_processor import LandmarkRecord, TileGeom
+from src.terrain import TileTerrain
 
 # Depth (mm) of carved water/road channels, capped relative to base thickness.
 CARVE_MAX_MM = 1.2
@@ -133,9 +134,102 @@ def _carve(base: trimesh.Trimesh, cutter_geom, depth: float, top_z: float):
 
 
 # ---------------------------------------------------------------------------
+# Terrain
+# ---------------------------------------------------------------------------
+def _terrain_solid(tt: TileTerrain) -> trimesh.Trimesh | None:
+    """Build a watertight terrain slab: heightmap top, flat bottom at Z=0."""
+    gx, gy, z = tt.gx_mm, tt.gy_mm, tt.z_mm
+    ny, nx = z.shape
+    xx, yy = np.meshgrid(gx, gy)
+
+    top = np.column_stack([xx.ravel(), yy.ravel(), z.ravel()])
+    bot = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(nx * ny)])
+    verts = np.vstack([top, bot])
+    n = nx * ny
+
+    def ti(j, i):        # top vertex index
+        return j * nx + i
+
+    def bi(j, i):        # bottom vertex index
+        return n + j * nx + i
+
+    faces = []
+    for j in range(ny - 1):
+        for i in range(nx - 1):
+            a, b, c, d = ti(j, i), ti(j, i + 1), ti(j + 1, i + 1), ti(j + 1, i)
+            faces += [[a, b, c], [a, c, d]]                       # top (up)
+            a2, b2, c2, d2 = bi(j, i), bi(j, i + 1), bi(j + 1, i + 1), bi(j + 1, i)
+            faces += [[a2, c2, b2], [a2, d2, c2]]                 # bottom (down)
+    for i in range(nx - 1):                                       # south / north skirts
+        faces += [[ti(0, i), bi(0, i), bi(0, i + 1)], [ti(0, i), bi(0, i + 1), ti(0, i + 1)]]
+        faces += [[ti(ny - 1, i + 1), bi(ny - 1, i + 1), bi(ny - 1, i)],
+                  [ti(ny - 1, i + 1), bi(ny - 1, i), ti(ny - 1, i)]]
+    for j in range(ny - 1):                                       # west / east skirts
+        faces += [[ti(j + 1, 0), bi(j + 1, 0), bi(j, 0)], [ti(j + 1, 0), bi(j, 0), ti(j, 0)]]
+        faces += [[ti(j, nx - 1), bi(j, nx - 1), bi(j + 1, nx - 1)],
+                  [ti(j, nx - 1), bi(j + 1, nx - 1), ti(j + 1, nx - 1)]]
+
+    try:
+        mesh = trimesh.Trimesh(vertices=verts, faces=np.asarray(faces), process=True)
+        mesh.merge_vertices()
+        mesh.fix_normals()
+        return mesh if not mesh.is_empty else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _boundary_edges(faces: np.ndarray):
+    """Edges that belong to exactly one triangle (the polygon boundary)."""
+    from collections import defaultdict
+
+    count = defaultdict(int)
+    order = {}
+    for tri in faces:
+        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+            key = (a, b) if a < b else (b, a)
+            count[key] += 1
+            order.setdefault(key, (a, b))
+    return [order[k] for k, c in count.items() if c == 1]
+
+
+def _drape_layer(geom, sampler, z_offset: float, thickness: float) -> trimesh.Trimesh | None:
+    """A thin slab that follows the terrain surface (for water / roads / parks)."""
+    meshes = []
+    for poly in _iter_polys(geom):
+        if poly.area <= 0:
+            continue
+        poly = poly.buffer(0)
+        for clean in _iter_polys(poly):
+            try:
+                v2d, tris = trimesh.creation.triangulate_polygon(clean, engine="earcut")
+            except Exception:  # noqa: BLE001
+                continue
+            if len(tris) == 0 or len(v2d) == 0:
+                continue
+            base_z = np.array([sampler(x, y) + z_offset for x, y in v2d])
+            top = np.column_stack([v2d[:, 0], v2d[:, 1], base_z + thickness])
+            bot = np.column_stack([v2d[:, 0], v2d[:, 1], base_z])
+            m = len(v2d)
+            verts = np.vstack([top, bot])
+            faces = [[a, b, c] for a, b, c in tris]                       # top
+            faces += [[c + m, b + m, a + m] for a, b, c in tris]          # bottom
+            for a, b in _boundary_edges(np.asarray(tris)):               # sides
+                faces += [[a, b, b + m], [a, b + m, a + m]]
+            try:
+                mesh = trimesh.Trimesh(vertices=verts, faces=np.asarray(faces), process=True)
+                if not mesh.is_empty and len(mesh.faces):
+                    meshes.append(mesh)
+            except Exception:  # noqa: BLE001
+                continue
+    if not meshes:
+        return None
+    return trimesh.util.concatenate(meshes)
+
+
+# ---------------------------------------------------------------------------
 # Tile assembly
 # ---------------------------------------------------------------------------
-def _build_landmark(lm: LandmarkRecord, base_t: float, *,
+def _build_landmark(lm: LandmarkRecord, ground: float, *,
                     fetch_models: bool, sketchfab_token: str | None):
     """Return (meshes, source_note). Tries a detailed downloaded model, else
     falls back to extruded walls plus an optional procedural roof."""
@@ -150,7 +244,7 @@ def _build_landmark(lm: LandmarkRecord, base_t: float, *,
                 model,
                 centroid_mm=lm.centroid_mm,
                 target_height_mm=lm.target_height_mm,
-                base_top_mm=base_t,
+                base_top_mm=ground,
                 embed_mm=EMBED_MM,
                 max_footprint_mm=lm.max_footprint_mm * 1.6,
             )
@@ -163,12 +257,12 @@ def _build_landmark(lm: LandmarkRecord, base_t: float, *,
         height = (z_top - z_bottom) + EMBED_MM
         if height <= 0:
             continue
-        wm = _extrude(geom, height, z0=base_t + z_bottom - EMBED_MM)
+        wm = _extrude(geom, height, z0=ground + z_bottom - EMBED_MM)
         if wm is not None:
             meshes.append(wm)
     if lm.roof_shape and lm.roof_height_mm > 0:
         roof = roofs.build_roof(
-            lm.footprint_mm, base_t + lm.roof_base_mm - EMBED_MM,
+            lm.footprint_mm, ground + lm.roof_base_mm - EMBED_MM,
             lm.roof_shape, lm.roof_height_mm + EMBED_MM, lm.roof_direction,
         )
         if roof is not None:
@@ -180,30 +274,57 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
                fetch_models: bool = False, sketchfab_token: str | None = None) -> TileMesh:
     """Assemble a single printable tile mesh from its prepared geometry."""
     base_t = tile.base_mm
+    terrain: TileTerrain | None = tile.terrain
     parts: list[trimesh.Trimesh] = []
     sources: list[str] = []
 
-    # --- Base plate, optionally carved with water + roads ---------------------
-    base = _base_plate(tile.size_w_mm, tile.size_h_mm, base_t)
-    if carve_features:
-        cutters = [g for g in (tile.water, tile.roads) if g is not None]
-        if cutters:
-            from shapely.ops import unary_union
+    # Ground height under a point: the terrain surface when terrain is on,
+    # otherwise the flat base-plate top. Buildings are draped onto this.
+    def ground(x: float, y: float) -> float:
+        return terrain.sample(x, y) if terrain is not None else base_t
 
-            depth = min(CARVE_MAX_MM, base_t * 0.6)
-            base, _ = _carve(base, unary_union(cutters), depth, base_t)
+    def centroid_ground(geom) -> float:
+        c = geom.centroid
+        return ground(float(c.x), float(c.y))
+
+    # --- Base: terrain solid, or a flat plate (optionally carved) --------------
+    base = None
+    if terrain is not None:
+        base = _terrain_solid(terrain)
+    if base is None:
+        terrain = None                           # terrain failed -> flat fallback
+        base = _base_plate(tile.size_w_mm, tile.size_h_mm, base_t)
+        if carve_features:
+            cutters = [g for g in (tile.water, tile.roads) if g is not None]
+            if cutters:
+                from shapely.ops import unary_union
+
+                depth = min(CARVE_MAX_MM, base_t * 0.6)
+                base, _ = _carve(base, unary_union(cutters), depth, base_t)
     parts.append(base)
 
-    # --- Thin raised park pads ------------------------------------------------
-    if tile.parks is not None:
+    # --- Water / roads / parks -------------------------------------------------
+    if terrain is not None:
+        # Drape thin conformal layers on the terrain surface.
+        if tile.parks is not None:
+            dm = _drape_layer(tile.parks, terrain.sample, 0.0, min(PARK_MAX_MM, 0.8))
+            if dm is not None:
+                parts.append(dm)
+        for layer, thick in ((tile.water, 0.4), (tile.roads, 0.5)):
+            if layer is not None:
+                dm = _drape_layer(layer, terrain.sample, 0.0, thick)
+                if dm is not None:
+                    parts.append(dm)
+    elif tile.parks is not None:
         park_t = min(PARK_MAX_MM, base_t * 0.4)
         pm = _extrude(tile.parks, park_t, z0=base_t)
         if pm is not None:
             parts.append(pm)
 
-    # --- Bulk buildings (slightly embedded into the base) ---------------------
+    # --- Bulk buildings (draped onto the ground) ------------------------------
     for height_mm, geom in tile.building_bins:
-        bm = _extrude(geom, height_mm + EMBED_MM, z0=base_t - EMBED_MM)
+        g0 = centroid_ground(geom)
+        bm = _extrude(geom, height_mm + EMBED_MM, z0=g0 - EMBED_MM)
         if bm is not None:
             parts.append(bm)
 
@@ -212,14 +333,16 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
         height = (z_top - z_bottom) + EMBED_MM
         if height <= 0:
             continue
-        dm = _extrude(geom, height, z0=base_t + z_bottom - EMBED_MM)
+        g0 = centroid_ground(geom)
+        dm = _extrude(geom, height, z0=g0 + z_bottom - EMBED_MM)
         if dm is not None:
             parts.append(dm)
 
     # --- Named landmarks: detailed model injection or procedural fallback ------
     for lm in tile.landmarks:
+        g0 = ground(lm.centroid_mm[0], lm.centroid_mm[1])
         meshes, source = _build_landmark(
-            lm, base_t, fetch_models=fetch_models, sketchfab_token=sketchfab_token)
+            lm, g0, fetch_models=fetch_models, sketchfab_token=sketchfab_token)
         parts.extend(meshes)
         if source:
             sources.append(source)

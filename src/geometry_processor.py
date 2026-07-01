@@ -39,7 +39,7 @@ from shapely.affinity import translate as shp_translate
 from shapely.geometry import box
 from shapely.ops import unary_union
 
-from src import roofs
+from src import roofs, terrain as terrain_mod
 from src.osm_fetcher import MapData
 
 # ---------------------------------------------------------------------------
@@ -52,6 +52,9 @@ HEIGHT_BIN_MM = 0.5            # height quantisation for bulk footprint unioning
 MIN_BUILDING_MM = 0.6            # floor on printed building height (mm)
 MIN_PART_MM = 0.4            # floor on printed thickness of a single 3D part
 DEFAULT_MAX_HEIGHT_MM = 50.0     # printable ceiling for the tallest feature (0 = off)
+DEFAULT_TERRAIN_EXAGG = 2.0      # vertical exaggeration for terrain relief
+DEFAULT_TERRAIN_CAP_MM = 25.0    # max printed terrain relief above the base (0 = off)
+TERRAIN_TILE_RES = 48            # per-tile terrain heightmap resolution
 
 # A building counts as a landmark (recognisable attraction) if it carries any of
 # these tags, has a notable building value, or is simply very tall.
@@ -155,6 +158,8 @@ class TileGeom:
     water: object | None = None
     roads: object | None = None
     parks: object | None = None
+    # Per-tile elevation surface (mm space); None = flat base.
+    terrain: object | None = None
 
     @property
     def building_count_bins(self) -> int:
@@ -504,6 +509,9 @@ def prepare_tiles(
     detail_level: str = DEFAULT_DETAIL_LEVEL,
     landmark_emphasis: float = 1.0,
     max_height_mm: float = DEFAULT_MAX_HEIGHT_MM,
+    terrain=None,
+    terrain_exaggeration: float = DEFAULT_TERRAIN_EXAGG,
+    terrain_cap_mm: float = DEFAULT_TERRAIN_CAP_MM,
     include_water: bool = True,
     include_roads: bool = True,
     include_parks: bool = True,
@@ -557,6 +565,11 @@ def prepare_tiles(
     if detail is not None and not detail.empty:
         detail = _assign_detail_heights(detail, detail_mult, scale, max_height_mm)
 
+    # With terrain, buildings are draped onto the surface individually, so we must
+    # not union footprints into shared height bins (each needs its own ground).
+    use_terrain = terrain is not None
+    elev_ref = terrain.elev_min if use_terrain else 0.0
+
     results: list[TileGeom] = []
     for j in range(tiles_y):
         for i in range(tiles_x):
@@ -576,10 +589,19 @@ def prepare_tiles(
                 parks=_to_tile_mm(_crop(parks_geom, tile_box), tcx, tcy, scale),
             )
 
+            if use_terrain:
+                tile.terrain = terrain_mod.build_tile_terrain(
+                    terrain, tcx_m=tcx, tcy_m=tcy, scale=scale,
+                    tile_w_mm=tile_w_mm, tile_h_mm=tile_h_mm, base_mm=preset["base_mm"],
+                    elev_ref=elev_ref, exaggeration=terrain_exaggeration,
+                    cap_mm=terrain_cap_mm, res=TERRAIN_TILE_RES,
+                )
+
             if bulk is not None and not bulk.empty:
                 in_tile = gpd.clip(bulk, tile_box)
                 in_tile = in_tile[in_tile.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-                tile.building_bins = _bin_buildings(in_tile, tcx, tcy, scale, z_mult, max_height_mm)
+                tile.building_bins = _bin_buildings(
+                    in_tile, tcx, tcy, scale, z_mult, max_height_mm, union=not use_terrain)
 
             if detail is not None and not detail.empty:
                 in_tile = gpd.clip(detail, tile_box)
@@ -593,10 +615,16 @@ def prepare_tiles(
     return results
 
 
-def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_height_mm):
-    """Group cropped bulk buildings by quantised height and union each group."""
+def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_height_mm, union=True):
+    """Bulk buildings as (height_mm, geometry).
+
+    ``union=True`` merges overlapping footprints per height bin (flat base, kills
+    internal faces). ``union=False`` keeps each building separate — required for
+    terrain, where every building is draped onto its own ground elevation.
+    """
     if in_tile.empty:
         return []
+    entries = []
     bins: dict[float, list] = {}
     for _, row in in_tile.iterrows():
         geom = _to_tile_mm(row.geometry, tcx, tcy, scale)
@@ -605,7 +633,12 @@ def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_heigh
         height_mm = _soft_cap(row["height_m"] * z_mult * scale, max_height_mm)
         height_mm = max(MIN_BUILDING_MM, height_mm)
         key = max(MIN_BUILDING_MM, round(round(height_mm / HEIGHT_BIN_MM) * HEIGHT_BIN_MM, 3))
-        bins.setdefault(key, []).append(geom)
+        if union:
+            bins.setdefault(key, []).append(geom)
+        else:
+            entries.append((key, geom))
+    if not union:
+        return entries
     out = []
     for height_mm, geoms in sorted(bins.items()):
         merged = _only_polygons(unary_union(geoms))
