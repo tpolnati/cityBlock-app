@@ -129,6 +129,7 @@ def _render_tile_preview(tile: geometry_processor.TileGeom) -> None:
     _plot_polys(ax, tile.parks, color="#7bb274", alpha=0.5, linewidth=0)
     _plot_polys(ax, tile.water, color="#4a90d9", alpha=0.7, linewidth=0)
     _plot_polys(ax, tile.roads, color="#888888", alpha=0.8, linewidth=0)
+    _plot_polys(ax, tile.bridges, color="#c0563b", alpha=0.95, linewidth=0)
     for _h, geom in tile.building_bins:
         _plot_polys(ax, geom, color="#2b2b2b", linewidth=0)
     # Generic 3D parts in a mid tone.
@@ -341,8 +342,11 @@ def main() -> None:
             disabled=not terrain_on,
         )
 
-        carve = st.checkbox("Carve water/roads into base", value=True,
-                            help="Ignored when terrain is on (features drape on the surface).")
+        carve_water = st.checkbox(
+            "Carve water into base", value=True,
+            help="Engrave water as recessed channels (flat base only; on terrain "
+                 "water drapes on the surface).",
+        )
         weld = st.checkbox(
             "Weld into single manifold (boolean union — slower)", value=False,
             help="Off: fast concatenation (buildings embedded into the base, "
@@ -352,6 +356,20 @@ def main() -> None:
         inc_water = feat[0].checkbox("Water", value=True)
         inc_roads = feat[1].checkbox("Roads", value=True)
         inc_parks = feat[2].checkbox("Parks", value=True)
+
+        st.markdown("**Roads & bridges**")
+        road_detail = st.selectbox(
+            "Road detail", list(geometry_processor.ROAD_DETAIL_LEVELS.keys()),
+            index=1, disabled=not inc_roads,
+            help="Which roads to include. Tiny footpaths/tracks/service alleys are "
+                 "always excluded. Bridges are rendered as raised decks.",
+        )
+        engrave_roads = st.checkbox(
+            "Engrave roads instead of raising them", value=False,
+            disabled=not inc_roads,
+            help="Default: roads are raised ridges. Engrave cuts them into a flat "
+                 "base instead (ignored when terrain is on).",
+        )
 
         st.markdown("**Detailed landmark models**")
         fetch_models = st.checkbox(
@@ -393,12 +411,13 @@ def main() -> None:
                     include_water=inc_water,
                     include_roads=inc_roads,
                     include_parks=inc_parks,
+                    road_detail=road_detail,
                 )
             spin = "Extruding {n} tile(s), fetching landmark models, exporting STL…" if fetch_models \
                 else "Extruding {n} tile(s) and exporting STL…"
             with st.spinner(spin.format(n=len(tiles))):
                 meshes = mesh_generator.build_all(
-                    tiles, carve_features=carve, weld=weld,
+                    tiles, carve_water=carve_water, engrave_roads=engrave_roads, weld=weld,
                     fetch_models=fetch_models, sketchfab_token=sketchfab_token,
                 )
 
@@ -423,10 +442,10 @@ def main() -> None:
             st.session_state["model_sources"] = all_sources
             emph = f" · landmarks ×{landmark_emphasis:g}" if landmark_emphasis != 1.0 else ""
             terr = f" · terrain ×{terrain_exagg:g}" if (terrain_on and dem is not None) else ""
+            roads_note = "engraved roads" if engrave_roads else "raised roads"
             st.session_state["gen_caption"] = (
                 f"{preset_name} · Z×{z_mult:g} · {detail_level} detail{emph}{terr} · "
-                f"{'welded' if weld else 'concatenated'}"
-                f"{'' if (terrain_on and dem is not None) else (' · carved' if carve else '')}"
+                f"{roads_note} · {'welded' if weld else 'concatenated'}"
             )
         except Exception as exc:  # noqa: BLE001 - surface a clean error in the UI
             st.session_state["generated"] = None

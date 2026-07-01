@@ -34,6 +34,9 @@ CARVE_MAX_MM = 1.2
 EMBED_MM = 0.2
 # Thin raised park layer thickness (mm).
 PARK_MAX_MM = 0.8
+# Raised-road ribbon thickness and the taller bridge deck height (mm).
+ROAD_RAISE_MM = 0.6
+BRIDGE_RAISE_MM = 2.0
 
 
 @dataclass
@@ -270,8 +273,9 @@ def _build_landmark(lm: LandmarkRecord, ground: float, *,
     return meshes, None
 
 
-def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = False,
-               fetch_models: bool = False, sketchfab_token: str | None = None) -> TileMesh:
+def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool = False,
+               weld: bool = False, fetch_models: bool = False,
+               sketchfab_token: str | None = None) -> TileMesh:
     """Assemble a single printable tile mesh from its prepared geometry."""
     base_t = tile.base_mm
     terrain: TileTerrain | None = tile.terrain
@@ -279,7 +283,7 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
     sources: list[str] = []
 
     # Ground height under a point: the terrain surface when terrain is on,
-    # otherwise the flat base-plate top. Buildings are draped onto this.
+    # otherwise the flat base-plate top. Features are draped onto this.
     def ground(x: float, y: float) -> float:
         return terrain.sample(x, y) if terrain is not None else base_t
 
@@ -287,39 +291,54 @@ def build_tile(tile: TileGeom, *, carve_features: bool = True, weld: bool = Fals
         c = geom.centroid
         return ground(float(c.x), float(c.y))
 
-    # --- Base: terrain solid, or a flat plate (optionally carved) --------------
+    def raised(geom, thickness: float):
+        """A raised feature (road/bridge/park) sitting on the surface."""
+        if geom is None:
+            return None
+        if terrain is not None:
+            return _drape_layer(geom, terrain.sample, 0.0, thickness)
+        return _extrude(geom, thickness + EMBED_MM, z0=base_t - EMBED_MM)
+
+    # --- Base: terrain solid, or a flat plate (water/roads optionally carved) ---
     base = None
     if terrain is not None:
         base = _terrain_solid(terrain)
     if base is None:
         terrain = None                           # terrain failed -> flat fallback
         base = _base_plate(tile.size_w_mm, tile.size_h_mm, base_t)
-        if carve_features:
-            cutters = [g for g in (tile.water, tile.roads) if g is not None]
-            if cutters:
-                from shapely.ops import unary_union
+        cutters = []
+        if carve_water and tile.water is not None:
+            cutters.append(tile.water)
+        if engrave_roads and tile.roads is not None:
+            cutters.append(tile.roads)
+        if cutters:
+            from shapely.ops import unary_union
 
-                depth = min(CARVE_MAX_MM, base_t * 0.6)
-                base, _ = _carve(base, unary_union(cutters), depth, base_t)
+            depth = min(CARVE_MAX_MM, base_t * 0.6)
+            base, _ = _carve(base, unary_union(cutters), depth, base_t)
     parts.append(base)
 
-    # --- Water / roads / parks -------------------------------------------------
-    if terrain is not None:
-        # Drape thin conformal layers on the terrain surface.
-        if tile.parks is not None:
-            dm = _drape_layer(tile.parks, terrain.sample, 0.0, min(PARK_MAX_MM, 0.8))
-            if dm is not None:
-                parts.append(dm)
-        for layer, thick in ((tile.water, 0.4), (tile.roads, 0.5)):
-            if layer is not None:
-                dm = _drape_layer(layer, terrain.sample, 0.0, thick)
-                if dm is not None:
-                    parts.append(dm)
-    elif tile.parks is not None:
-        park_t = min(PARK_MAX_MM, base_t * 0.4)
-        pm = _extrude(tile.parks, park_t, z0=base_t)
-        if pm is not None:
-            parts.append(pm)
+    # --- Water (drape on terrain; carved into a flat base above) ---------------
+    if terrain is not None and tile.water is not None:
+        dm = _drape_layer(tile.water, terrain.sample, 0.0, 0.4)
+        if dm is not None:
+            parts.append(dm)
+
+    # --- Parks: thin raised pad -----------------------------------------------
+    pm = raised(tile.parks, min(PARK_MAX_MM, base_t * 0.4 if terrain is None else PARK_MAX_MM))
+    if pm is not None:
+        parts.append(pm)
+
+    # --- Roads: raised ribbons (unless engraved into a flat base) --------------
+    if not (engrave_roads and terrain is None):
+        rm = raised(tile.roads, ROAD_RAISE_MM)
+        if rm is not None:
+            parts.append(rm)
+
+    # --- Bridges: taller raised decks so crossings stand out ------------------
+    bm2 = raised(tile.bridges, BRIDGE_RAISE_MM)
+    if bm2 is not None:
+        parts.append(bm2)
 
     # --- Bulk buildings (draped onto the ground) ------------------------------
     for height_mm, geom in tile.building_bins:
@@ -377,11 +396,12 @@ def _finalize(mesh: trimesh.Trimesh) -> None:
     mesh.apply_translation([-cx, -cy, -minz])
 
 
-def build_all(tiles: list[TileGeom], *, carve_features: bool = True, weld: bool = False,
-              fetch_models: bool = False, sketchfab_token: str | None = None) -> list[TileMesh]:
+def build_all(tiles: list[TileGeom], *, carve_water: bool = True, engrave_roads: bool = False,
+              weld: bool = False, fetch_models: bool = False,
+              sketchfab_token: str | None = None) -> list[TileMesh]:
     """Build every tile in a preset (1 tile normally, 4 for the Tier-3 mega map)."""
     return [
-        build_tile(t, carve_features=carve_features, weld=weld,
+        build_tile(t, carve_water=carve_water, engrave_roads=engrave_roads, weld=weld,
                    fetch_models=fetch_models, sketchfab_token=sketchfab_token)
         for t in tiles
     ]

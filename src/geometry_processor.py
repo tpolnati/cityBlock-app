@@ -96,15 +96,33 @@ DETAIL_LEVELS: dict[str, dict] = {
 }
 DEFAULT_DETAIL_LEVEL = "High"
 
-# Road carve widths by OSM highway class (full width, metres).
+# Road widths by OSM highway class (full width, metres).
 ROAD_WIDTH_M = {
     "motorway": 16.0, "motorway_link": 10.0,
-    "trunk": 14.0, "primary": 12.0, "primary_link": 8.0,
+    "trunk": 14.0, "trunk_link": 9.0, "primary": 12.0, "primary_link": 8.0,
     "secondary": 10.0, "secondary_link": 7.0,
-    "tertiary": 8.0, "residential": 6.0, "unclassified": 6.0,
-    "living_street": 5.0, "service": 4.0, "pedestrian": 4.0,
+    "tertiary": 8.0, "tertiary_link": 6.0, "residential": 6.0, "unclassified": 6.0,
+    "living_street": 5.0, "service": 4.0, "pedestrian": 4.0, "road": 6.0,
 }
 ROAD_WIDTH_DEFAULT_M = 6.0
+
+# Importance rank per highway class (higher = bigger road). Anything not listed
+# (footway/path/track/cycleway/steps…) is a "super small road" and is dropped.
+ROAD_CLASS_RANK = {
+    "motorway": 5, "motorway_link": 5, "trunk": 5, "trunk_link": 5,
+    "primary": 4, "primary_link": 4, "secondary": 4, "secondary_link": 4,
+    "tertiary": 3, "tertiary_link": 3,
+    "residential": 2, "unclassified": 2, "road": 2,
+    "living_street": 1, "service": 1, "pedestrian": 1,
+}
+# "Road detail" presets -> minimum rank kept.
+ROAD_DETAIL_LEVELS = {
+    "Major roads only": 3,          # motorway..tertiary
+    "Major + residential": 2,       # + residential/unclassified   (default)
+    "All roads (incl. service)": 1,  # + service/living_street/pedestrian
+}
+DEFAULT_ROAD_DETAIL = "Major + residential"
+BRIDGE_MIN_RANK = 2                  # ignore bridges on tiny/service-only ways
 
 WATERWAY_WIDTH_M = {
     "river": 14.0, "canal": 10.0, "stream": 4.0, "dock": 12.0, "riverbank": 16.0,
@@ -157,6 +175,7 @@ class TileGeom:
     landmarks: list[LandmarkRecord] = field(default_factory=list)
     water: object | None = None
     roads: object | None = None
+    bridges: object | None = None
     parks: object | None = None
     # Per-tile elevation surface (mm space); None = flat base.
     terrain: object | None = None
@@ -308,6 +327,49 @@ def _road_width(row) -> float:
     if isinstance(hw, list):
         hw = hw[0] if hw else None
     return ROAD_WIDTH_M.get(hw, ROAD_WIDTH_DEFAULT_M)
+
+
+def _build_roads(gdf: gpd.GeoDataFrame, min_rank: int):
+    """Filter roads by importance and split bridges out.
+
+    Returns (roads_geom, bridges_geom) as buffered polygon geometries in metres
+    (or None). Tiny paths (footway/track/cycleway/steps…) are dropped entirely;
+    ``bridge=yes`` ways become the separate bridge layer (rendered raised).
+    """
+    if gdf is None or gdf.empty:
+        return None, None
+    road_pieces, bridge_pieces = [], []
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        hw = _first(_get(row, "highway"))
+        rank = ROAD_CLASS_RANK.get(hw)
+        if rank is None or rank < min_rank:
+            continue
+        width = ROAD_WIDTH_M.get(hw, ROAD_WIDTH_DEFAULT_M)
+        gtype = geom.geom_type
+        if gtype in ("LineString", "MultiLineString"):
+            buf = geom.buffer(width / 2.0, cap_style=2, join_style=1)
+        elif gtype in ("Polygon", "MultiPolygon"):
+            buf = geom.buffer(0)
+        else:
+            continue
+        if buf.is_empty:
+            continue
+        if _truthy(_get(row, "bridge")) and rank >= BRIDGE_MIN_RANK:
+            bridge_pieces.append(buf)
+        else:
+            road_pieces.append(buf)
+
+    roads_geom = unary_union(road_pieces) if road_pieces else None
+    bridges_geom = unary_union(bridge_pieces) if bridge_pieces else None
+    # Don't draw the flat road under a bridge deck.
+    if roads_geom is not None and bridges_geom is not None:
+        roads_geom = roads_geom.difference(bridges_geom)
+        if roads_geom.is_empty:
+            roads_geom = None
+    return roads_geom, bridges_geom
 
 
 def _water_width(row) -> float:
@@ -515,6 +577,7 @@ def prepare_tiles(
     include_water: bool = True,
     include_roads: bool = True,
     include_parks: bool = True,
+    road_detail: str = DEFAULT_ROAD_DETAIL,
     seed: int = 42,
 ) -> list[TileGeom]:
     """Turn fetched OSM layers into a list of millimetre-space ``TileGeom`` tiles.
@@ -540,10 +603,15 @@ def prepare_tiles(
 
     # --- Land features: buffer to polygons, recentre (metres) -----------------
     water_geom = _buffer_layer(map_data.water, _water_width, WATERWAY_WIDTH_DEFAULT_M) if include_water else None
-    roads_geom = _buffer_layer(map_data.roads, _road_width, ROAD_WIDTH_DEFAULT_M) if include_roads else None
+    if include_roads:
+        min_rank = ROAD_DETAIL_LEVELS.get(road_detail, ROAD_DETAIL_LEVELS[DEFAULT_ROAD_DETAIL])
+        roads_geom, bridges_geom = _build_roads(map_data.roads, min_rank)
+    else:
+        roads_geom = bridges_geom = None
     parks_geom = _buffer_layer(map_data.parks, lambda r: None, 0.0) if include_parks else None
     water_geom = shp_translate(water_geom, -cx, -cy) if water_geom is not None else None
     roads_geom = shp_translate(roads_geom, -cx, -cy) if roads_geom is not None else None
+    bridges_geom = shp_translate(bridges_geom, -cx, -cy) if bridges_geom is not None else None
     parks_geom = shp_translate(parks_geom, -cx, -cy) if parks_geom is not None else None
 
     # --- Crop-box geometry sized to the preset's physical aspect ratio --------
@@ -586,6 +654,7 @@ def prepare_tiles(
                 size_w_mm=tile_w_mm, size_h_mm=tile_h_mm, base_mm=preset["base_mm"],
                 water=_to_tile_mm(_crop(water_geom, tile_box), tcx, tcy, scale),
                 roads=_to_tile_mm(_crop(roads_geom, tile_box), tcx, tcy, scale),
+                bridges=_to_tile_mm(_crop(bridges_geom, tile_box), tcx, tcy, scale),
                 parks=_to_tile_mm(_crop(parks_geom, tile_box), tcx, tcy, scale),
             )
 

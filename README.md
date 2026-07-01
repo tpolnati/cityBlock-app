@@ -126,6 +126,23 @@ from where.
 > Model fetching is **opt-in** because it hits external services and is slower —
 > but there's no time limit on export, so leave it on for hero pieces.
 
+### Roads & bridges
+
+Roads render as **raised ridges** on the base (or draped on terrain), sized by
+OSM class. A **Road detail** selector controls how much of the network appears:
+
+| Road detail | Includes |
+|---|---|
+| Major roads only | motorway → tertiary |
+| Major + residential *(default)* | + residential / unclassified |
+| All roads (incl. service) | + service / living-street / pedestrian |
+
+Tiny ways — footways, tracks, cycleways, steps, alleys — are **always dropped**.
+**Bridges** (`bridge=yes`) are pulled out of the road network and printed as
+**taller raised decks** so crossings stand out; the flat road beneath a deck is
+removed to avoid a doubled ribbon. (Optional: *Engrave roads* cuts them into a
+flat base instead of raising them.)
+
 ### Terrain / elevation
 
 By default the ground is flat (which backlights most evenly). Turn on **"Add
@@ -198,6 +215,7 @@ detail, height or model options recomputes the mesh only — never the OSM data.
 | Terrain grid / tile resolution | `terrain.fetch_terrain grid_n`, `TERRAIN_TILE_RES` | 56 / 48 |
 | Height bin size | `geometry_processor.HEIGHT_BIN_MM` | 0.5 mm |
 | Road / waterway widths | `geometry_processor.ROAD_WIDTH_M / WATERWAY_WIDTH_M` | by OSM class |
+| Raised road / bridge height | `mesh_generator.ROAD_RAISE_MM / BRIDGE_RAISE_MM` | 0.6 / 2.0 mm |
 | Carve depth | `mesh_generator.CARVE_MAX_MM` | 1.2 mm |
 | Building base embed | `mesh_generator.EMBED_MM` | 0.2 mm |
 | Park pad thickness | `mesh_generator.PARK_MAX_MM` | 0.8 mm |
