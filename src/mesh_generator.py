@@ -34,9 +34,14 @@ CARVE_MAX_MM = 1.2
 EMBED_MM = 0.2
 # Thin raised park layer thickness (mm).
 PARK_MAX_MM = 0.8
-# Raised-road ribbon thickness and the taller bridge deck height (mm).
+# Raised-road ribbon thickness (mm).
 ROAD_RAISE_MM = 0.6
-BRIDGE_RAISE_MM = 2.0
+# Accurate bridge: deck clearance above what it crosses, deck thickness, spacing
+# between support piers along the span, and pier column footprint (mm).
+BRIDGE_CLEARANCE_MM = 2.2
+BRIDGE_DECK_MM = 0.9
+BRIDGE_PIER_SPACING_MM = 16.0
+BRIDGE_PIER_SIZE_MM = 1.6
 
 
 @dataclass
@@ -229,6 +234,59 @@ def _drape_layer(geom, sampler, z_offset: float, thickness: float) -> trimesh.Tr
     return trimesh.util.concatenate(meshes)
 
 
+def _build_bridge(line_mm, width_mm: float, ground_fn):
+    """Build an accurate bridge from a centreline: raised deck + support piers.
+
+    The deck is a flat slab held at a clearance above what it crosses, set to the
+    higher of its two abutment ends so it connects to the approaching roads.
+    Piers drop from the deck to the local ground at intervals (taller across a
+    valley/river), and full-width abutments close off each end — leaving the open
+    spans between piers that make it read as a real bridge.
+    """
+    coords = list(line_mm.coords)
+    if len(coords) < 2 or width_mm <= 0:
+        return []
+
+    length = line_mm.length
+    end_ground = max(ground_fn(*coords[0]), ground_fn(*coords[-1]))
+    deck_bottom = end_ground + BRIDGE_CLEARANCE_MM
+    deck_top = deck_bottom + BRIDGE_DECK_MM
+
+    meshes = []
+    # Deck: buffer the centreline into a ribbon and extrude the slab.
+    ribbon = line_mm.buffer(width_mm / 2.0, cap_style=2, join_style=1)
+    deck = _extrude(ribbon, deck_top - deck_bottom, z0=deck_bottom)
+    if deck is not None:
+        meshes.append(deck)
+
+    # Piers / abutments along the span, inset by half a pier so end abutments
+    # never overhang the tile edge when a bridge reaches the boundary.
+    inset = BRIDGE_PIER_SIZE_MM / 2.0
+    usable = max(0.0, length - 2.0 * inset)
+    n = max(1, int(round(usable / BRIDGE_PIER_SPACING_MM)))
+    for k in range(n + 1):
+        p = line_mm.interpolate(inset + usable * k / n)
+        gs = ground_fn(p.x, p.y)
+        top = deck_bottom + EMBED_MM
+        bottom = gs - EMBED_MM
+        h = top - bottom
+        if h <= 0.3:
+            continue
+        is_end = (k == 0 or k == n)
+        # Orient the pier across the deck; abutments span the full width.
+        if len(coords) >= 2:
+            ang = np.arctan2(coords[-1][1] - coords[0][1], coords[-1][0] - coords[0][0])
+        else:
+            ang = 0.0
+        cross = width_mm if is_end else BRIDGE_PIER_SIZE_MM
+        along = BRIDGE_PIER_SIZE_MM
+        col = trimesh.creation.box(extents=[along, cross, h])
+        col.apply_transform(trimesh.transformations.rotation_matrix(ang, [0, 0, 1]))
+        col.apply_translation([p.x, p.y, bottom + h / 2.0])
+        meshes.append(col)
+    return meshes
+
+
 # ---------------------------------------------------------------------------
 # Tile assembly
 # ---------------------------------------------------------------------------
@@ -335,10 +393,9 @@ def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool 
         if rm is not None:
             parts.append(rm)
 
-    # --- Bridges: taller raised decks so crossings stand out ------------------
-    bm2 = raised(tile.bridges, BRIDGE_RAISE_MM)
-    if bm2 is not None:
-        parts.append(bm2)
+    # --- Bridges: accurate elevated decks with piers --------------------------
+    for line_mm, width_mm in tile.bridges:
+        parts.extend(_build_bridge(line_mm, width_mm, ground))
 
     # --- Bulk buildings (draped onto the ground) ------------------------------
     for height_mm, geom in tile.building_bins:

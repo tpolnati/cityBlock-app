@@ -138,10 +138,19 @@ OSM class. A **Road detail** selector controls how much of the network appears:
 | All roads (incl. service) | + service / living-street / pedestrian |
 
 Tiny ways — footways, tracks, cycleways, steps, alleys — are **always dropped**.
-**Bridges** (`bridge=yes`) are pulled out of the road network and printed as
-**taller raised decks** so crossings stand out; the flat road beneath a deck is
-removed to avoid a doubled ribbon. (Optional: *Engrave roads* cuts them into a
-flat base instead of raising them.)
+(Optional: *Engrave roads* cuts them into a flat base instead of raising them.)
+
+**Bridges** (`bridge=yes`) are modelled as **real elevated structures**, not solid
+bars: from each bridge's centreline the app builds a flat **deck** held at a
+clearance above what it crosses, a row of **support piers** at intervals with
+**open spans** between them, and full-width **abutments** closing off each end so
+the deck connects to the approaching roads. On terrain the piers grow taller
+across a valley/river so the deck stays level with its banks. The flat road under
+a deck is removed to avoid a doubled ribbon.
+
+> Bridges have real open spans underneath. Piers keep the unsupported gaps short,
+> but for FDM you may still want print supports on the longest spans (resin
+> handles them easily). Pier spacing/clearance are tunable in `mesh_generator`.
 
 ### Terrain / elevation
 
@@ -215,7 +224,8 @@ detail, height or model options recomputes the mesh only — never the OSM data.
 | Terrain grid / tile resolution | `terrain.fetch_terrain grid_n`, `TERRAIN_TILE_RES` | 56 / 48 |
 | Height bin size | `geometry_processor.HEIGHT_BIN_MM` | 0.5 mm |
 | Road / waterway widths | `geometry_processor.ROAD_WIDTH_M / WATERWAY_WIDTH_M` | by OSM class |
-| Raised road / bridge height | `mesh_generator.ROAD_RAISE_MM / BRIDGE_RAISE_MM` | 0.6 / 2.0 mm |
+| Raised road height | `mesh_generator.ROAD_RAISE_MM` | 0.6 mm |
+| Bridge clearance / deck / pier spacing | `mesh_generator.BRIDGE_CLEARANCE_MM / _DECK_MM / _PIER_SPACING_MM` | 2.2 / 0.9 / 16 mm |
 | Carve depth | `mesh_generator.CARVE_MAX_MM` | 1.2 mm |
 | Building base embed | `mesh_generator.EMBED_MM` | 0.2 mm |
 | Park pad thickness | `mesh_generator.PARK_MAX_MM` | 0.8 mm |

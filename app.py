@@ -129,7 +129,9 @@ def _render_tile_preview(tile: geometry_processor.TileGeom) -> None:
     _plot_polys(ax, tile.parks, color="#7bb274", alpha=0.5, linewidth=0)
     _plot_polys(ax, tile.water, color="#4a90d9", alpha=0.7, linewidth=0)
     _plot_polys(ax, tile.roads, color="#888888", alpha=0.8, linewidth=0)
-    _plot_polys(ax, tile.bridges, color="#c0563b", alpha=0.95, linewidth=0)
+    for line_mm, width_mm in tile.bridges:
+        _plot_polys(ax, line_mm.buffer(max(width_mm, 1.0) / 2.0),
+                    color="#c0563b", alpha=0.95, linewidth=0)
     for _h, geom in tile.building_bins:
         _plot_polys(ax, geom, color="#2b2b2b", linewidth=0)
     # Generic 3D parts in a mid tone.

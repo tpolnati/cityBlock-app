@@ -175,7 +175,8 @@ class TileGeom:
     landmarks: list[LandmarkRecord] = field(default_factory=list)
     water: object | None = None
     roads: object | None = None
-    bridges: object | None = None
+    # Bridges as centrelines: list of (LineString_mm, width_mm) for real decks/piers.
+    bridges: list = field(default_factory=list)
     parks: object | None = None
     # Per-tile elevation surface (mm space); None = flat base.
     terrain: object | None = None
@@ -329,16 +330,28 @@ def _road_width(row) -> float:
     return ROAD_WIDTH_M.get(hw, ROAD_WIDTH_DEFAULT_M)
 
 
+def _iter_lines(geom):
+    """Yield LineStrings from any Line/MultiLine/GeometryCollection."""
+    if geom is None or geom.is_empty:
+        return
+    if geom.geom_type == "LineString":
+        yield geom
+    elif geom.geom_type in ("MultiLineString", "GeometryCollection"):
+        for g in geom.geoms:
+            yield from _iter_lines(g)
+
+
 def _build_roads(gdf: gpd.GeoDataFrame, min_rank: int):
     """Filter roads by importance and split bridges out.
 
-    Returns (roads_geom, bridges_geom) as buffered polygon geometries in metres
-    (or None). Tiny paths (footway/track/cycleway/steps…) are dropped entirely;
-    ``bridge=yes`` ways become the separate bridge layer (rendered raised).
+    Returns ``(roads_geom, bridge_lines)`` where ``roads_geom`` is a buffered
+    polygon in metres (or None) and ``bridge_lines`` is a list of
+    ``(LineString, width_m)`` centrelines — kept as lines so the mesh stage can
+    build a real elevated deck with piers. Tiny paths are dropped entirely.
     """
     if gdf is None or gdf.empty:
-        return None, None
-    road_pieces, bridge_pieces = [], []
+        return None, []
+    road_pieces, bridge_lines, bridge_polys = [], [], []
     for _, row in gdf.iterrows():
         geom = row.geometry
         if geom is None or geom.is_empty:
@@ -349,27 +362,25 @@ def _build_roads(gdf: gpd.GeoDataFrame, min_rank: int):
             continue
         width = ROAD_WIDTH_M.get(hw, ROAD_WIDTH_DEFAULT_M)
         gtype = geom.geom_type
+        is_bridge = _truthy(_get(row, "bridge")) and rank >= BRIDGE_MIN_RANK
+
         if gtype in ("LineString", "MultiLineString"):
-            buf = geom.buffer(width / 2.0, cap_style=2, join_style=1)
+            if is_bridge:
+                for seg in _iter_lines(geom):
+                    bridge_lines.append((seg, width))
+                bridge_polys.append(geom.buffer(width / 2.0, cap_style=2, join_style=1))
+            else:
+                road_pieces.append(geom.buffer(width / 2.0, cap_style=2, join_style=1))
         elif gtype in ("Polygon", "MultiPolygon"):
-            buf = geom.buffer(0)
-        else:
-            continue
-        if buf.is_empty:
-            continue
-        if _truthy(_get(row, "bridge")) and rank >= BRIDGE_MIN_RANK:
-            bridge_pieces.append(buf)
-        else:
-            road_pieces.append(buf)
+            road_pieces.append(geom.buffer(0))   # area road/pedestrian square
 
     roads_geom = unary_union(road_pieces) if road_pieces else None
-    bridges_geom = unary_union(bridge_pieces) if bridge_pieces else None
     # Don't draw the flat road under a bridge deck.
-    if roads_geom is not None and bridges_geom is not None:
-        roads_geom = roads_geom.difference(bridges_geom)
+    if roads_geom is not None and bridge_polys:
+        roads_geom = roads_geom.difference(unary_union(bridge_polys))
         if roads_geom.is_empty:
             roads_geom = None
-    return roads_geom, bridges_geom
+    return roads_geom, bridge_lines
 
 
 def _water_width(row) -> float:
@@ -418,6 +429,20 @@ def _crop(geom, tile_box):
     if geom is None or geom.is_empty:
         return None
     return _only_polygons(geom.intersection(tile_box))
+
+
+def _bridge_lines_to_tile(bridge_lines, tile_box, tcx, tcy, scale):
+    """Crop bridge centrelines to a tile and convert to (LineString_mm, width_mm)."""
+    out = []
+    for line, width_m in bridge_lines:
+        if line is None or line.is_empty:
+            continue
+        clipped = line.intersection(tile_box)
+        for seg in _iter_lines(clipped):
+            seg_mm = _to_tile_mm(seg, tcx, tcy, scale)
+            if seg_mm is not None and seg_mm.length > 1.0:
+                out.append((seg_mm, width_m * scale))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -605,14 +630,14 @@ def prepare_tiles(
     water_geom = _buffer_layer(map_data.water, _water_width, WATERWAY_WIDTH_DEFAULT_M) if include_water else None
     if include_roads:
         min_rank = ROAD_DETAIL_LEVELS.get(road_detail, ROAD_DETAIL_LEVELS[DEFAULT_ROAD_DETAIL])
-        roads_geom, bridges_geom = _build_roads(map_data.roads, min_rank)
+        roads_geom, bridge_lines = _build_roads(map_data.roads, min_rank)
     else:
-        roads_geom = bridges_geom = None
+        roads_geom, bridge_lines = None, []
     parks_geom = _buffer_layer(map_data.parks, lambda r: None, 0.0) if include_parks else None
     water_geom = shp_translate(water_geom, -cx, -cy) if water_geom is not None else None
     roads_geom = shp_translate(roads_geom, -cx, -cy) if roads_geom is not None else None
-    bridges_geom = shp_translate(bridges_geom, -cx, -cy) if bridges_geom is not None else None
     parks_geom = shp_translate(parks_geom, -cx, -cy) if parks_geom is not None else None
+    bridge_lines = [(shp_translate(line, -cx, -cy), w) for line, w in bridge_lines]
 
     # --- Crop-box geometry sized to the preset's physical aspect ratio --------
     full_w_mm, full_h_mm = preset["size_mm"]
@@ -654,9 +679,9 @@ def prepare_tiles(
                 size_w_mm=tile_w_mm, size_h_mm=tile_h_mm, base_mm=preset["base_mm"],
                 water=_to_tile_mm(_crop(water_geom, tile_box), tcx, tcy, scale),
                 roads=_to_tile_mm(_crop(roads_geom, tile_box), tcx, tcy, scale),
-                bridges=_to_tile_mm(_crop(bridges_geom, tile_box), tcx, tcy, scale),
                 parks=_to_tile_mm(_crop(parks_geom, tile_box), tcx, tcy, scale),
             )
+            tile.bridges = _bridge_lines_to_tile(bridge_lines, tile_box, tcx, tcy, scale)
 
             if use_terrain:
                 tile.terrain = terrain_mod.build_tile_terrain(
