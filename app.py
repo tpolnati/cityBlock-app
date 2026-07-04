@@ -98,6 +98,8 @@ def _render_preview(md: osm_fetcher.MapData) -> None:
         md.roads.plot(ax=ax, color="#555555", linewidth=0.5)
     if not md.buildings.empty:
         md.buildings.plot(ax=ax, color="#2b2b2b", linewidth=0)
+    if md.attractions is not None and not md.attractions.empty:
+        md.attractions.plot(ax=ax, color="#d4a017", markersize=18, linewidth=0)
 
     ax.set_aspect("equal")
     ax.set_title("Projected layers (local UTM, metres)")
@@ -252,14 +254,21 @@ def main() -> None:
         f"({md.radius_m:g} m radius) — projected to **{md.utm_crs}**."
     )
 
-    m = st.columns(4)
+    m = st.columns(5)
     m[0].metric("Buildings", md.building_count)
-    m[1].metric("Water features", md.water_count)
-    m[2].metric("Roads", md.road_count)
-    m[3].metric("Parks / green", md.park_count)
+    m[1].metric("Attractions", md.attraction_count)
+    m[2].metric("Water features", md.water_count)
+    m[3].metric("Roads", md.road_count)
+    m[4].metric("Parks / green", md.park_count)
 
     for note in md.notes:
         st.warning(note)
+    if md.attraction_count:
+        st.caption(
+            f"Found {md.attraction_count} standalone attraction(s) (statues, "
+            "monuments, towers). Use **High/Maximum** detail + **Fetch landmark "
+            "models** to render them recognisably."
+        )
 
     left, right = st.columns([3, 2])
     with left:

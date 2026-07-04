@@ -73,11 +73,19 @@ Burj Khalifa should be won't do. The app handles this with three mechanisms:
   stacked part-polygons, each with its own `height` and `min_height`. At **High**
   / **Maximum** detail these are extruded individually, reproducing setbacks and
   the tapering spire that make a tower identifiable.
-- **Landmark detection.** Buildings tagged `tourism`/`historic`/`man_made=tower`,
+- **Landmark detection.** Buildings tagged `tourism`/`historic`/`man_made`,
   carrying a `wikidata`/`wikipedia` reference, having a notable `building` value
   (cathedral, stadium, tower…), or simply very tall are flagged as landmarks.
   They're kept at full footprint fidelity (little/no simplification) and never
   merged into their neighbours. They're highlighted **gold** in the 2D preview.
+- **Standalone attractions.** Many icons aren't *buildings* in OSM — the Statue
+  of Liberty, obelisks, memorials and statues are tagged `historic`/`man_made`/
+  `tourism` on a point or small polygon. These are fetched separately, given a
+  footprint (points are buffered) and a sensible default height, and routed into
+  the same landmark path — so they get a downloaded model (or at least a visible
+  marker) instead of being missing entirely. *Note: some sit outside a city
+  centre (e.g. Liberty Island is ~2.5 km from Lower Manhattan), so widen the
+  radius or centre the search on the attraction to include it.*
 - **Printable height with preserved silhouette.** A landmark's parts are scaled
   *proportionally to that building's own height*, and the overall top is bounded
   by **Max relief height** via a smooth `tanh` knee. So an 828 m tower tops out

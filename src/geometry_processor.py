@@ -66,6 +66,12 @@ LANDMARK_BUILDING_VALUES = {
 }
 LANDMARK_NAMED_HEIGHT_M = 60.0    # a *named* building this tall is a landmark
 LANDMARK_ANY_HEIGHT_M = 120.0     # anything this tall is a landmark regardless
+LANDMARK_MANMADE = {"tower", "monument", "obelisk", "statue", "lighthouse", "campanile"}
+
+# Standalone attractions (statues/monuments that aren't buildings).
+MONUMENT_DEFAULT_HEIGHT_M = 30.0  # fallback print height for an untagged monument
+MONUMENT_POINT_RADIUS_M = 6.0     # footprint radius given to a point attraction
+MONUMENT_MAX_AREA_M2 = 8000.0     # skip huge attraction areas (theme parks etc.)
 
 # Default share of a building's printed height given to its roof when the OSM
 # roof:height tag is missing, keyed by roof shape.
@@ -257,12 +263,20 @@ def roof_shape_of(value) -> str | None:
     return str(value).strip().lower() if _truthy(value) else None
 
 
+def is_attraction(row) -> bool:
+    """A standalone monument/statue: not a building, but a tourism/historic/man_made feature."""
+    if _truthy(_get(row, "building")):
+        return False
+    return any(_truthy(_get(row, k)) for k in ("tourism", "historic", "man_made"))
+
+
 def building_z_range(row, rng: random.Random) -> tuple[float, float]:
-    """Real-world (z_bottom, z_top) in metres for a building or building:part.
+    """Real-world (z_bottom, z_top) in metres for a building, part or monument.
 
     ``height`` / ``building:levels`` give the top; ``min_height`` / ``min_level``
     give the floating base of an upper 3D part. Missing tops fall back to a
-    random 3–9 m so plain buildings still have relief.
+    monument default for attractions, else a random 3–9 m so plain buildings
+    still have relief.
     """
     top = _parse_float(_get(row, "height"))
     if top is None:
@@ -278,17 +292,21 @@ def building_z_range(row, rng: random.Random) -> tuple[float, float]:
     bottom = max(0.0, bottom or 0.0)
 
     if top is None or top <= bottom:
-        top = bottom + rng.uniform(DEFAULT_MIN_M, DEFAULT_MAX_M)
+        if is_attraction(row):
+            top = bottom + MONUMENT_DEFAULT_HEIGHT_M
+        else:
+            top = bottom + rng.uniform(DEFAULT_MIN_M, DEFAULT_MAX_M)
     return bottom, top
 
 
 def is_landmark(row, top_m: float) -> bool:
-    """Heuristic: is this building a recognisable attraction worth extra detail?"""
+    """Heuristic: is this a recognisable attraction worth a detailed model?"""
     if any(_truthy(_get(row, k)) for k in LANDMARK_TAG_KEYS):
         return True
-    if _get(row, "man_made") is not None and str(_get(row, "man_made")).strip().lower() == "tower":
+    mm = _first(_get(row, "man_made"))
+    if isinstance(mm, str) and mm.strip().lower() in LANDMARK_MANMADE:
         return True
-    bval = _get(row, "building")
+    bval = _first(_get(row, "building"))
     if isinstance(bval, str) and bval.strip().lower() in LANDMARK_BUILDING_VALUES:
         return True
     if top_m >= LANDMARK_ANY_HEIGHT_M:
@@ -585,6 +603,57 @@ def _classify_buildings(buildings: gpd.GeoDataFrame, level: dict, seed: int):
     return bulk, detail
 
 
+def _prepare_attractions(gdf: gpd.GeoDataFrame, buildings: gpd.GeoDataFrame):
+    """Normalise non-building attractions into small footprints for the landmark path.
+
+    Point attractions (statues/monuments) are buffered into a small footprint;
+    polygon attractions are kept if not enormous. Attractions that overlap an
+    existing building are dropped (that building already represents them).
+    """
+    if gdf is None or gdf.empty:
+        return None
+
+    geoms, keep = [], []
+    for _, row in gdf.iterrows():
+        g = row.geometry
+        if g is None or g.is_empty:
+            geoms.append(None)
+            keep.append(False)
+            continue
+        gt = g.geom_type
+        if gt in ("Point", "MultiPoint"):
+            poly = g.buffer(MONUMENT_POINT_RADIUS_M)
+        elif gt in ("Polygon", "MultiPolygon"):
+            poly = g.buffer(0)
+            if poly.is_empty or poly.area > MONUMENT_MAX_AREA_M2:
+                geoms.append(None)
+                keep.append(False)
+                continue
+        else:                                   # lines etc. aren't monuments
+            geoms.append(None)
+            keep.append(False)
+            continue
+        geoms.append(poly)
+        keep.append(True)
+
+    out = gdf.copy()
+    out["geometry"] = geoms
+    out = out[pd.Series(keep, index=gdf.index)]
+    if out.empty:
+        return None
+    out = out.set_geometry("geometry")
+
+    # Drop attractions already represented by a building footprint.
+    if buildings is not None and not buildings.empty:
+        try:
+            joined = gpd.sjoin(out, buildings[["geometry"]], predicate="intersects", how="left")
+            covered = joined.index[joined["index_right"].notna()].unique()
+            out = out.drop(index=covered)
+        except Exception:  # noqa: BLE001 - dedup is best-effort
+            pass
+    return out if not out.empty else None
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -613,9 +682,13 @@ def prepare_tiles(
     level = DETAIL_LEVELS.get(detail_level, DETAIL_LEVELS[DEFAULT_DETAIL_LEVEL])
     cx, cy = project_center(map_data.center_latlon, map_data.utm_crs)
 
-    # --- Buildings: classify, recentre on full-crop centre, simplify ----------
+    # --- Buildings (+ standalone attractions): classify, recentre, simplify ----
     buildings = map_data.buildings
     buildings = buildings[buildings.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+    attractions = _prepare_attractions(getattr(map_data, "attractions", None), buildings)
+    if attractions is not None and not attractions.empty:
+        buildings = pd.concat([buildings, attractions]) if not buildings.empty else attractions
+        buildings = gpd.GeoDataFrame(buildings, geometry="geometry", crs=map_data.utm_crs)
     bulk = detail = None
     if not buildings.empty:
         bulk, detail = _classify_buildings(buildings, level, seed)

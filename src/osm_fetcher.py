@@ -62,6 +62,18 @@ ROAD_TAGS = {
     ],
 }
 
+# Standalone attractions/monuments that are NOT buildings — statues, memorials,
+# obelisks, towers, lighthouses… (e.g. the Statue of Liberty). These come as
+# points or small polygons and are routed into the landmark pipeline so they can
+# receive a detailed downloaded model.
+ATTRACTION_TAGS = {
+    "tourism": ["attraction", "monument", "artwork", "viewpoint"],
+    "historic": ["monument", "memorial", "castle", "fort", "citadel",
+                 "ruins", "archaeological_site", "tower", "city_gate"],
+    "man_made": ["monument", "tower", "obelisk", "statue", "lighthouse",
+                 "communications_tower", "campanile"],
+}
+
 PARK_TAGS = {
     "leisure": ["park", "garden", "recreation_ground", "pitch", "playground"],
     "landuse": ["grass", "recreation_ground", "village_green", "meadow", "forest"],
@@ -83,7 +95,12 @@ class MapData:
     water: gpd.GeoDataFrame
     roads: gpd.GeoDataFrame
     parks: gpd.GeoDataFrame
+    attractions: gpd.GeoDataFrame = None      # non-building monuments/statues
     notes: list[str] = field(default_factory=list)  # non-fatal fetch warnings
+
+    @property
+    def attraction_count(self) -> int:
+        return 0 if self.attractions is None else len(self.attractions)
 
     # --- convenience accessors -------------------------------------------------
     @property
@@ -213,6 +230,7 @@ def fetch_map_data(lat: float, lon: float, radius_m: float) -> MapData:
     water_ll = _fetch_features(lat, lon, radius_m, WATER_TAGS)
     roads_ll = _fetch_features(lat, lon, radius_m, ROAD_TAGS)
     parks_ll = _fetch_features(lat, lon, radius_m, PARK_TAGS)
+    attractions_ll = _fetch_features(lat, lon, radius_m, ATTRACTION_TAGS)
 
     if water_ll.empty:
         notes.append("No waterways/water bodies found in this area.")
@@ -229,5 +247,6 @@ def fetch_map_data(lat: float, lon: float, radius_m: float) -> MapData:
         water=_project(water_ll, utm_crs),
         roads=_project(roads_ll, utm_crs),
         parks=_project(parks_ll, utm_crs),
+        attractions=_project(attractions_ll, utm_crs),
         notes=notes,
     )
