@@ -19,6 +19,7 @@ Construction per tile
 from __future__ import annotations
 
 import io
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -42,6 +43,10 @@ BRIDGE_CLEARANCE_MM = 2.2
 BRIDGE_DECK_MM = 0.9
 BRIDGE_PIER_SPACING_MM = 16.0
 BRIDGE_PIER_SIZE_MM = 1.6
+# Integrated print supports: no downward-facing deck span is left unsupported by
+# more than this, filled with thin snippable posts (small cubes) to the surface.
+SUPPORT_MAX_SPAN_MM = 8.0
+SUPPORT_POST_MM = 0.9
 
 
 @dataclass
@@ -234,56 +239,68 @@ def _drape_layer(geom, sampler, z_offset: float, thickness: float) -> trimesh.Tr
     return trimesh.util.concatenate(meshes)
 
 
-def _build_bridge(line_mm, width_mm: float, ground_fn):
+def _bridge_column(p, ang, gs, deck_bottom, along, cross):
+    """A vertical box from local ground up into the deck (pier / abutment / post)."""
+    top = deck_bottom + EMBED_MM
+    bottom = gs - EMBED_MM
+    h = top - bottom
+    if h <= 0.3:
+        return None
+    col = trimesh.creation.box(extents=[along, cross, h])
+    col.apply_transform(trimesh.transformations.rotation_matrix(ang, [0, 0, 1]))
+    col.apply_translation([p.x, p.y, bottom + h / 2.0])
+    return col
+
+
+def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True):
     """Build an accurate bridge from a centreline: raised deck + support piers.
 
     The deck is a flat slab held at a clearance above what it crosses, set to the
     higher of its two abutment ends so it connects to the approaching roads.
-    Piers drop from the deck to the local ground at intervals (taller across a
-    valley/river), and full-width abutments close off each end — leaving the open
-    spans between piers that make it read as a real bridge.
+    Wide piers drop to the local ground at intervals (taller across a valley),
+    full-width abutments close off each end, and — when ``add_supports`` — thin
+    snippable posts subdivide the open spans so no downward-facing deck run is
+    left unsupported for printing. Everything welds deck-to-ground.
     """
     coords = list(line_mm.coords)
     if len(coords) < 2 or width_mm <= 0:
         return []
 
     length = line_mm.length
+    ang = float(np.arctan2(coords[-1][1] - coords[0][1], coords[-1][0] - coords[0][0]))
     end_ground = max(ground_fn(*coords[0]), ground_fn(*coords[-1]))
     deck_bottom = end_ground + BRIDGE_CLEARANCE_MM
     deck_top = deck_bottom + BRIDGE_DECK_MM
 
     meshes = []
-    # Deck: buffer the centreline into a ribbon and extrude the slab.
     ribbon = line_mm.buffer(width_mm / 2.0, cap_style=2, join_style=1)
     deck = _extrude(ribbon, deck_top - deck_bottom, z0=deck_bottom)
     if deck is not None:
         meshes.append(deck)
 
-    # Piers / abutments along the span, inset by half a pier so end abutments
-    # never overhang the tile edge when a bridge reaches the boundary.
+    # Structural piers/abutments, inset so end abutments never overhang the edge.
     inset = BRIDGE_PIER_SIZE_MM / 2.0
     usable = max(0.0, length - 2.0 * inset)
     n = max(1, int(round(usable / BRIDGE_PIER_SPACING_MM)))
-    for k in range(n + 1):
-        p = line_mm.interpolate(inset + usable * k / n)
-        gs = ground_fn(p.x, p.y)
-        top = deck_bottom + EMBED_MM
-        bottom = gs - EMBED_MM
-        h = top - bottom
-        if h <= 0.3:
-            continue
-        is_end = (k == 0 or k == n)
-        # Orient the pier across the deck; abutments span the full width.
-        if len(coords) >= 2:
-            ang = np.arctan2(coords[-1][1] - coords[0][1], coords[-1][0] - coords[0][0])
-        else:
-            ang = 0.0
-        cross = width_mm if is_end else BRIDGE_PIER_SIZE_MM
-        along = BRIDGE_PIER_SIZE_MM
-        col = trimesh.creation.box(extents=[along, cross, h])
-        col.apply_transform(trimesh.transformations.rotation_matrix(ang, [0, 0, 1]))
-        col.apply_translation([p.x, p.y, bottom + h / 2.0])
-        meshes.append(col)
+    pier_ds = [inset + usable * k / n for k in range(n + 1)]
+    for k, d in enumerate(pier_ds):
+        p = line_mm.interpolate(d)
+        cross = width_mm if (k == 0 or k == n) else BRIDGE_PIER_SIZE_MM
+        col = _bridge_column(p, ang, ground_fn(p.x, p.y), deck_bottom, BRIDGE_PIER_SIZE_MM, cross)
+        if col is not None:
+            meshes.append(col)
+
+    # Print supports: thin posts subdividing each pier gap to <= SUPPORT_MAX_SPAN.
+    if add_supports:
+        for a, b in zip(pier_ds, pier_ds[1:]):
+            gap = b - a
+            sub = max(1, int(math.ceil(gap / SUPPORT_MAX_SPAN_MM)))
+            for j in range(1, sub):
+                p = line_mm.interpolate(a + gap * j / sub)
+                col = _bridge_column(p, ang, ground_fn(p.x, p.y), deck_bottom,
+                                     SUPPORT_POST_MM, SUPPORT_POST_MM)
+                if col is not None:
+                    meshes.append(col)
     return meshes
 
 
@@ -332,7 +349,7 @@ def _build_landmark(lm: LandmarkRecord, ground: float, *,
 
 
 def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool = False,
-               weld: bool = False, fetch_models: bool = False,
+               add_supports: bool = True, weld: bool = False, fetch_models: bool = False,
                sketchfab_token: str | None = None) -> TileMesh:
     """Assemble a single printable tile mesh from its prepared geometry."""
     base_t = tile.base_mm
@@ -393,9 +410,9 @@ def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool 
         if rm is not None:
             parts.append(rm)
 
-    # --- Bridges: accurate elevated decks with piers --------------------------
+    # --- Bridges: accurate elevated decks with piers (+ print supports) -------
     for line_mm, width_mm in tile.bridges:
-        parts.extend(_build_bridge(line_mm, width_mm, ground))
+        parts.extend(_build_bridge(line_mm, width_mm, ground, add_supports=add_supports))
 
     # --- Bulk buildings (draped onto the ground) ------------------------------
     for height_mm, geom in tile.building_bins:
@@ -454,11 +471,12 @@ def _finalize(mesh: trimesh.Trimesh) -> None:
 
 
 def build_all(tiles: list[TileGeom], *, carve_water: bool = True, engrave_roads: bool = False,
-              weld: bool = False, fetch_models: bool = False,
+              add_supports: bool = True, weld: bool = False, fetch_models: bool = False,
               sketchfab_token: str | None = None) -> list[TileMesh]:
     """Build every tile in a preset (1 tile normally, 4 for the Tier-3 mega map)."""
     return [
-        build_tile(t, carve_water=carve_water, engrave_roads=engrave_roads, weld=weld,
+        build_tile(t, carve_water=carve_water, engrave_roads=engrave_roads,
+                   add_supports=add_supports, weld=weld,
                    fetch_models=fetch_models, sketchfab_token=sketchfab_token)
         for t in tiles
     ]

@@ -156,9 +156,21 @@ the deck connects to the approaching roads. On terrain the piers grow taller
 across a valley/river so the deck stays level with its banks. The flat road under
 a deck is removed to avoid a doubled ribbon.
 
-> Bridges have real open spans underneath. Piers keep the unsupported gaps short,
-> but for FDM you may still want print supports on the longest spans (resin
-> handles them easily). Pier spacing/clearance are tunable in `mesh_generator`.
+> Bridges have real open spans underneath. With **Add print supports** on (the
+> default) the app fills each span with thin snippable posts down to the base, so
+> the model prints flat with no slicer supports and the posts snap off cleanly if
+> you want the open look. Pier spacing/clearance/support spacing are tunable in
+> `mesh_generator`.
+
+### Print supports
+
+**Add print supports** (on by default) detects overhangs that couldn't print
+flat and adds thin, integrated posts from the underside down to the base or
+terrain. In practice the case that needs this is the **bridge deck** (buildings
+are vertical, roofs slope upward, and terrain is a heightmap — none overhang).
+Under each bridge no downward-facing span is left unsupported by more than
+`SUPPORT_MAX_SPAN_MM` (8 mm); the posts are `SUPPORT_POST_MM` (0.9 mm) squares
+that weld deck-to-ground and snip off if you'd rather print with slicer supports.
 
 ### Terrain / elevation
 
@@ -234,6 +246,7 @@ detail, height or model options recomputes the mesh only — never the OSM data.
 | Road / waterway widths | `geometry_processor.ROAD_WIDTH_M / WATERWAY_WIDTH_M` | by OSM class |
 | Raised road height | `mesh_generator.ROAD_RAISE_MM` | 0.6 mm |
 | Bridge clearance / deck / pier spacing | `mesh_generator.BRIDGE_CLEARANCE_MM / _DECK_MM / _PIER_SPACING_MM` | 2.2 / 0.9 / 16 mm |
+| Print support max span / post size | `mesh_generator.SUPPORT_MAX_SPAN_MM / SUPPORT_POST_MM` | 8 / 0.9 mm |
 | Carve depth | `mesh_generator.CARVE_MAX_MM` | 1.2 mm |
 | Building base embed | `mesh_generator.EMBED_MM` | 0.2 mm |
 | Park pad thickness | `mesh_generator.PARK_MAX_MM` | 0.8 mm |

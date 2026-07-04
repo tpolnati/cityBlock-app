@@ -387,6 +387,12 @@ def main() -> None:
             help="Engrave water as recessed channels (flat base only; on terrain "
                  "water drapes on the surface).",
         )
+        add_supports = st.checkbox(
+            "Add print supports where needed", value=True,
+            help="Detects overhangs that would need support to print (mainly bridge "
+                 "decks over their open spans) and adds thin snippable posts from the "
+                 "underside down to the base/terrain, so the model prints as-is.",
+        )
         weld = st.checkbox(
             "Weld into single manifold (boolean union — slower)", value=False,
             help="Off: fast concatenation (buildings embedded into the base, "
@@ -457,7 +463,8 @@ def main() -> None:
                 else "Extruding {n} tile(s) and exporting STL…"
             with st.spinner(spin.format(n=len(tiles))):
                 meshes = mesh_generator.build_all(
-                    tiles, carve_water=carve_water, engrave_roads=engrave_roads, weld=weld,
+                    tiles, carve_water=carve_water, engrave_roads=engrave_roads,
+                    add_supports=add_supports, weld=weld,
                     fetch_models=fetch_models, sketchfab_token=sketchfab_token,
                 )
 
@@ -483,9 +490,10 @@ def main() -> None:
             emph = f" · landmarks ×{landmark_emphasis:g}" if landmark_emphasis != 1.0 else ""
             terr = f" · terrain ×{terrain_exagg:g}" if (terrain_on and dem is not None) else ""
             roads_note = "engraved roads" if engrave_roads else "raised roads"
+            supp = " · supports" if add_supports else ""
             st.session_state["gen_caption"] = (
                 f"{preset_name} · Z×{z_mult:g} · {detail_level} detail{emph}{terr} · "
-                f"{roads_note} · {'welded' if weld else 'concatenated'}"
+                f"{roads_note}{supp} · {'welded' if weld else 'concatenated'}"
             )
         except Exception as exc:  # noqa: BLE001 - surface a clean error in the UI
             st.session_state["generated"] = None
