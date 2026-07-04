@@ -19,6 +19,7 @@ Design notes
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -250,3 +251,60 @@ def fetch_map_data(lat: float, lon: float, radius_m: float) -> MapData:
         attractions=_project(attractions_ll, utm_crs),
         notes=notes,
     )
+
+
+# ---------------------------------------------------------------------------
+# "Notable attractions nearby" hint (looks in a wider ring than the crop)
+# ---------------------------------------------------------------------------
+def _haversine_m(lat1, lon1, lat2, lon2) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _compass(lat1, lon1, lat2, lon2) -> str:
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(math.radians(lat2))
+    x = (math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
+         - math.sin(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.cos(dlon))
+    brng = (math.degrees(math.atan2(y, x)) + 360) % 360
+    return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((brng + 22.5) % 360 // 45)]
+
+
+@st.cache_data(show_spinner=False)
+def nearby_attractions(lat: float, lon: float, outer_radius_m: float) -> list[dict]:
+    """Notable (named + Wikidata-linked) attractions within ``outer_radius_m``.
+
+    Used to hint when a famous landmark sits just outside the chosen crop radius.
+    Returns [{name, qid, dist_m, compass}], de-duplicated by Wikidata id, nearest
+    first. Never raises — returns [] on any failure.
+    """
+    try:
+        gdf = _fetch_features(lat, lon, outer_radius_m, ATTRACTION_TAGS)
+    except Exception:  # noqa: BLE001
+        return []
+    if gdf is None or gdf.empty:
+        return []
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    for _, row in gdf.iterrows():
+        name = row["name"] if "name" in row.index else None
+        qid = row["wikidata"] if "wikidata" in row.index else None
+        if not name or not qid or not isinstance(name, str) or not isinstance(qid, str):
+            continue
+        if qid in seen:
+            continue
+        try:
+            c = row.geometry.centroid
+            dist = _haversine_m(lat, lon, c.y, c.x)
+        except Exception:  # noqa: BLE001
+            continue
+        seen.add(qid)
+        out.append({"name": name.strip(), "qid": qid.strip(),
+                    "dist_m": dist, "compass": _compass(lat, lon, c.y, c.x)})
+    out.sort(key=lambda a: a["dist_m"])
+    return out

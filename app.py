@@ -14,6 +14,7 @@ Scope
 
 from __future__ import annotations
 
+import math
 import re
 
 import matplotlib.pyplot as plt
@@ -78,6 +79,7 @@ def _init_state() -> None:
         "generated": None,         # list[dict] of exported tiles, or None
         "gen_caption": "",         # human-readable description of last generation
         "model_sources": [],       # notes on landmarks rendered from downloaded models
+        "attraction_hint": [],     # famous attractions just outside the crop radius
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -231,6 +233,18 @@ def main() -> None:
                 st.session_state["map_data"] = md
                 st.session_state["last_query"] = location
                 st.session_state["last_radius"] = float(radius_m)
+
+                # One-time check for famous attractions just outside the crop.
+                st.session_state["attraction_hint"] = []
+                try:
+                    with st.spinner("Checking for notable landmarks nearby…"):
+                        outer = min(8000.0, max(md.radius_m * 3.0, md.radius_m + 2500.0))
+                        near = osm_fetcher.nearby_attractions(lat, lon, outer)
+                    st.session_state["attraction_hint"] = [
+                        a for a in near if a["dist_m"] > md.radius_m
+                    ]
+                except Exception:  # noqa: BLE001 - hint is best-effort
+                    st.session_state["attraction_hint"] = []
         except ValueError as exc:
             st.session_state["map_data"] = None
             st.session_state["fetch_error"] = str(exc)
@@ -268,6 +282,21 @@ def main() -> None:
             f"Found {md.attraction_count} standalone attraction(s) (statues, "
             "monuments, towers). Use **High/Maximum** detail + **Fetch landmark "
             "models** to render them recognisably."
+        )
+
+    # Hint when famous attractions sit just outside the chosen radius (computed
+    # once at fetch time and stored, so we never hit the network on a rerun).
+    outside = st.session_state.get("attraction_hint") or []
+    if outside:
+        need = int(math.ceil(outside[0]["dist_m"] / 50.0) * 50)
+        listed = ", ".join(
+            f"**{a['name']}** (~{a['dist_m'] / 1000:.1f} km {a['compass']})"
+            for a in outside[:5]
+        )
+        st.info(
+            f"🗽 Notable attractions just outside your radius: {listed}. "
+            f"Increase the radius to ~**{need} m** (or search that place directly) "
+            "to include the nearest one."
         )
 
     left, right = st.columns([3, 2])
