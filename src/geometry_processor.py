@@ -500,6 +500,10 @@ def _annotate(buildings: gpd.GeoDataFrame, level: dict, seed: int) -> gpd.GeoDat
         b, t = building_z_range(row, rng)
         shape = roof_shape_of(_get(row, "roof:shape"))
         rh = _parse_float(_get(row, "roof:height"))
+        # Give untagged monuments/statues a tapered obelisk marker so they read
+        # as landmarks even when no detailed model is downloaded.
+        if shape is None and is_attraction(row):
+            shape = "pyramidal"
         cols["_is_part"].append(part)
         cols["_is_outline"].append(outline or not part)
         cols["zb_m"].append(b)
