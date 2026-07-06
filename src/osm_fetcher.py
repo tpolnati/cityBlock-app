@@ -200,6 +200,10 @@ def _fetch_features(lat: float, lon: float, radius_m: float, tags: dict) -> gpd.
 
     # Drop rows with no geometry; keep the index for traceability.
     gdf = gdf[~gdf.geometry.isna()].copy()
+    # osmnx/Overpass can emit duplicate column labels; drop them so downstream
+    # scalar lookups never return a Series.
+    if gdf.columns.duplicated().any():
+        gdf = gdf.loc[:, ~gdf.columns.duplicated()]
     return gdf
 
 

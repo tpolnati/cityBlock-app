@@ -227,10 +227,23 @@ def _parse_float(value) -> float | None:
 
 def _truthy(value) -> bool:
     """True if an OSM tag is set to a meaningful (non-empty, non-'no') value."""
+    if isinstance(value, pd.Series):
+        value = value.iloc[0] if len(value) else None
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return False
     text = str(value).strip().lower()
     return text not in ("", "no", "false", "0", "nan")
+
+
+def _as_float(value, default: float = 0.0) -> float:
+    """Coerce a cell to float, tolerating a Series (duplicate column labels)."""
+    if isinstance(value, pd.Series):
+        value = value.iloc[0] if len(value) else None
+    try:
+        f = float(value)
+        return default if f != f else f      # guard NaN
+    except (TypeError, ValueError):
+        return default
 
 
 def _get(row, key):
@@ -570,7 +583,7 @@ def _classify_buildings(buildings: gpd.GeoDataFrame, level: dict, seed: int):
                 cl_geom = clusters[int(cid)]
             except (TypeError, ValueError, IndexError):
                 cl_geom = unary_union([work.loc[i, "geometry"] for i in pidxs])
-            h_real = max(float(work.loc[i, "zt_m"]) for i in pidxs)
+            h_real = max(_as_float(work.loc[i, "zt_m"]) for i in pidxs)
 
             cand = outlines[outlines.intersects(cl_geom)] if cl_geom is not None else outlines.iloc[0:0]
             covered.update(cand.index.tolist())
@@ -579,7 +592,7 @@ def _classify_buildings(buildings: gpd.GeoDataFrame, level: dict, seed: int):
             key = None
             if chosen is not None:
                 key = _landmark_key(chosen["lm_qid"], chosen["lm_name"], f"cid:{cid}")
-                h_real = max(h_real, float(chosen["zt_m"]))
+                h_real = max(h_real, _as_float(chosen["zt_m"]))
 
             for i in pidxs:
                 cluster_h[i] = h_real
@@ -690,8 +703,13 @@ def prepare_tiles(
     buildings = map_data.buildings
     buildings = buildings[buildings.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
     attractions = _prepare_attractions(getattr(map_data, "attractions", None), buildings)
-    if attractions is not None and not attractions.empty:
-        buildings = pd.concat([buildings, attractions]) if not buildings.empty else attractions
+    # Merge with a fresh unique index (ignore_index) and drop duplicate column
+    # labels — real OSM data can repeat both, which otherwise makes scalar lookups
+    # return a Series (and collapses distinct landmarks that share an osmid).
+    frames = [f for f in (buildings, attractions) if f is not None and not f.empty]
+    if frames:
+        buildings = pd.concat(frames, ignore_index=True)
+        buildings = buildings.loc[:, ~buildings.columns.duplicated()]
         buildings = gpd.GeoDataFrame(buildings, geometry="geometry", crs=map_data.utm_crs)
     bulk = detail = None
     if not buildings.empty:
@@ -801,7 +819,7 @@ def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_heigh
         geom = _to_tile_mm(row.geometry, tcx, tcy, scale)
         if geom is None:
             continue
-        height_mm = _soft_cap(row["height_m"] * z_mult * scale, max_height_mm)
+        height_mm = _soft_cap(_as_float(row.get("height_m")) * z_mult * scale, max_height_mm)
         height_mm = max(MIN_BUILDING_MM, height_mm)
         key = max(MIN_BUILDING_MM, round(round(height_mm / HEIGHT_BIN_MM) * HEIGHT_BIN_MM, 3))
         if union:
@@ -830,10 +848,10 @@ def _assign_detail_heights(detail: gpd.GeoDataFrame, mult: float, scale: float, 
     pz_b = pd.Series(0.0, index=detail.index)
     pz_t = pd.Series(0.0, index=detail.index)
     for idx, row in detail.iterrows():
-        h_real = float(row.get("cluster_h_m") or 0.0) or float(row["zt_m"]) or 1.0
+        h_real = _as_float(row.get("cluster_h_m")) or _as_float(row.get("zt_m")) or 1.0
         target = _soft_cap(h_real * mult * scale, cap)
-        pz_t[idx] = target * (float(row["zt_m"]) / h_real)
-        pz_b[idx] = target * (max(0.0, float(row["zb_m"])) / h_real)
+        pz_t[idx] = target * (_as_float(row.get("zt_m")) / h_real)
+        pz_b[idx] = target * (max(0.0, _as_float(row.get("zb_m"))) / h_real)
     detail["pz_b"] = pz_b
     detail["pz_t"] = pz_t
     return detail
@@ -855,8 +873,8 @@ def _build_tile_detail(in_tile: gpd.GeoDataFrame, tcx, tcy, scale):
         geom = _to_tile_mm(row.geometry, tcx, tcy, scale)
         if geom is None:
             continue
-        zb = max(0.0, float(row.get("pz_b", 0.0)))
-        zt = float(row.get("pz_t", 0.0))
+        zb = max(0.0, _as_float(row.get("pz_b")))
+        zt = _as_float(row.get("pz_t"))
         if zt - zb < MIN_PART_MM:
             zt = zb + MIN_PART_MM
 
@@ -874,7 +892,7 @@ def _build_tile_detail(in_tile: gpd.GeoDataFrame, tcx, tcy, scale):
                  "qid": str(qid) if _truthy(qid) else None,
                  "name": str(name) if _truthy(name) else None,
                  "roof_shape": str(shape) if _truthy(shape) else None,
-                 "roof_frac": float(row.get("roof_frac") or 0.0),
+                 "roof_frac": _as_float(row.get("roof_frac")),
                  "roof_dir": row.get("roof_dir")}
             groups[key] = g
         g["geoms"].append(geom)
