@@ -323,8 +323,10 @@ def _perp(ang):
     return (-math.sin(ang), math.cos(ang))
 
 
-def _deck_and_supports(line_mm, width_mm, ground_fn, add_supports, deck_bottom, deck_top, ang):
+def _deck_and_supports(line_mm, width_mm, ground_fn, add_supports, deck_bottom, deck_top, ang,
+                       min_feature_mm=0.1):
     """The shared substructure: deck slab + piers/abutments + print supports."""
+    post_sz = max(SUPPORT_POST_MM, min_feature_mm)
     length = line_mm.length
     meshes = []
     ribbon = line_mm.buffer(width_mm / 2.0, cap_style=2, join_style=1)
@@ -349,15 +351,16 @@ def _deck_and_supports(line_mm, width_mm, ground_fn, add_supports, deck_bottom, 
             sub = max(1, int(math.ceil(gap / SUPPORT_MAX_SPAN_MM)))
             for j in range(1, sub):
                 p = line_mm.interpolate(a + gap * j / sub)
-                col = _bridge_column(p, ang, ground_fn(p.x, p.y), deck_bottom,
-                                     SUPPORT_POST_MM, SUPPORT_POST_MM)
+                col = _bridge_column(p, ang, ground_fn(p.x, p.y), deck_bottom, post_sz, post_sz)
                 if col is not None:
                     meshes.append(col)
     return meshes
 
 
-def _suspension_superstructure(line_mm, width_mm, ground_fn, deck_top, ang):
+def _suspension_superstructure(line_mm, width_mm, ground_fn, deck_top, ang, min_feature_mm=0.1):
     """Two towers + draped main cables + vertical hangers (e.g. the Golden Gate)."""
+    cable_r = max(BRIDGE_CABLE_R_MM, min_feature_mm / 2.0)
+    hanger_r = max(BRIDGE_HANGER_R_MM, min_feature_mm / 2.0)
     length = line_mm.length
     px, py = _perp(ang)
     half = width_mm / 2.0
@@ -389,21 +392,23 @@ def _suspension_superstructure(line_mm, width_mm, ground_fn, deck_top, ang):
             s = k / steps
             p = line_mm.interpolate(length * s)
             pts.append([p.x + px * side * half, p.y + py * side * half, cable_z(s)])
-        cable = _tube(pts, BRIDGE_CABLE_R_MM)
+        cable = _tube(pts, cable_r)
         if cable is not None:
             meshes.append(cable)
         # hangers from the cable down to the deck edge, between the towers.
         for k in range(steps + 1):
             s = k / steps
             if f1 < s < f2 and k % 2 == 0 and pts[k][2] - deck_top > 0.6:
-                h = _cyl(pts[k], [pts[k][0], pts[k][1], deck_top], BRIDGE_HANGER_R_MM)
+                h = _cyl(pts[k], [pts[k][0], pts[k][1], deck_top], hanger_r)
                 if h is not None:
                     meshes.append(h)
     return meshes
 
 
-def _arch_superstructure(line_mm, width_mm, ground_fn, deck_bottom, deck_top, ang):
+def _arch_superstructure(line_mm, width_mm, ground_fn, deck_bottom, deck_top, ang, min_feature_mm=0.1):
     """A curved arch rib below the deck, springing from the banks, plus spandrels."""
+    arch_r = max(BRIDGE_ARCH_R_MM, min_feature_mm / 2.0)
+    hanger_r = max(BRIDGE_HANGER_R_MM, min_feature_mm / 2.0)
     length = line_mm.length
     px, py = _perp(ang)
     half = width_mm / 2.0 * 0.8
@@ -421,19 +426,20 @@ def _arch_superstructure(line_mm, width_mm, ground_fn, deck_bottom, deck_top, an
             p = line_mm.interpolate(length * s)
             z = end_g + rise * math.sin(math.pi * s)
             pts.append([p.x + px * side * half, p.y + py * side * half, z])
-        rib = _tube(pts, BRIDGE_ARCH_R_MM)
+        rib = _tube(pts, arch_r)
         if rib is not None:
             meshes.append(rib)
         # spandrel columns from the arch up to the deck.
         for k in range(steps + 1):
             if 0 < k < steps and k % 3 == 0 and deck_bottom - pts[k][2] > 0.6:
-                col = _cyl(pts[k], [pts[k][0], pts[k][1], deck_bottom + EMBED_MM], BRIDGE_HANGER_R_MM)
+                col = _cyl(pts[k], [pts[k][0], pts[k][1], deck_bottom + EMBED_MM], hanger_r)
                 if col is not None:
                     meshes.append(col)
     return meshes
 
 
-def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True, structure=None):
+def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True,
+                  structure=None, min_feature_mm: float = 0.1):
     """Build a bridge from its centreline, rendered by ``bridge:structure``.
 
     All types share a flat deck held at a clearance above what it crosses (set to
@@ -442,9 +448,12 @@ def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True
       * suspension / cable-stayed -> two towers, draped main cables, hangers;
       * arch -> a curved arch rib under the deck with spandrel columns;
       * otherwise -> a beam/trestle bridge (deck on piers).
+
+    A deck narrower than ``min_feature_mm`` is skipped (unprintable), and thin
+    elements (posts, cables, hangers, ribs) are floored to that thickness.
     """
     coords = list(line_mm.coords)
-    if len(coords) < 2 or width_mm <= 0:
+    if len(coords) < 2 or width_mm < min_feature_mm:
         return []
 
     ang = float(np.arctan2(coords[-1][1] - coords[0][1], coords[-1][0] - coords[0][0]))
@@ -453,13 +462,13 @@ def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True
     deck_top = deck_bottom + BRIDGE_DECK_MM
 
     meshes = _deck_and_supports(line_mm, width_mm, ground_fn, add_supports,
-                                deck_bottom, deck_top, ang)
+                                deck_bottom, deck_top, ang, min_feature_mm)
     s = (structure or "").strip().lower()
     try:
         if s in SUSPENSION_STRUCTURES:
-            meshes += _suspension_superstructure(line_mm, width_mm, ground_fn, deck_top, ang)
+            meshes += _suspension_superstructure(line_mm, width_mm, ground_fn, deck_top, ang, min_feature_mm)
         elif s in ARCH_STRUCTURES:
-            meshes += _arch_superstructure(line_mm, width_mm, ground_fn, deck_bottom, deck_top, ang)
+            meshes += _arch_superstructure(line_mm, width_mm, ground_fn, deck_bottom, deck_top, ang, min_feature_mm)
     except Exception:  # noqa: BLE001 - superstructure is best-effort; keep the deck
         pass
     return meshes
@@ -510,8 +519,8 @@ def _build_landmark(lm: LandmarkRecord, ground: float, *,
 
 
 def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool = False,
-               add_supports: bool = True, weld: bool = False, fetch_models: bool = False,
-               sketchfab_token: str | None = None) -> TileMesh:
+               add_supports: bool = True, min_feature_mm: float = 0.1, weld: bool = False,
+               fetch_models: bool = False, sketchfab_token: str | None = None) -> TileMesh:
     """Assemble a single printable tile mesh from its prepared geometry."""
     base_t = tile.base_mm
     terrain: TileTerrain | None = tile.terrain
@@ -573,8 +582,8 @@ def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool 
 
     # --- Bridges: rendered by real-world structure (suspension/arch/beam) ------
     for line_mm, width_mm, structure in tile.bridges:
-        parts.extend(_build_bridge(line_mm, width_mm, ground,
-                                   add_supports=add_supports, structure=structure))
+        parts.extend(_build_bridge(line_mm, width_mm, ground, add_supports=add_supports,
+                                   structure=structure, min_feature_mm=min_feature_mm))
 
     # --- Bulk buildings (draped onto the ground) ------------------------------
     for height_mm, geom in tile.building_bins:
@@ -633,12 +642,12 @@ def _finalize(mesh: trimesh.Trimesh) -> None:
 
 
 def build_all(tiles: list[TileGeom], *, carve_water: bool = True, engrave_roads: bool = False,
-              add_supports: bool = True, weld: bool = False, fetch_models: bool = False,
-              sketchfab_token: str | None = None) -> list[TileMesh]:
+              add_supports: bool = True, min_feature_mm: float = 0.1, weld: bool = False,
+              fetch_models: bool = False, sketchfab_token: str | None = None) -> list[TileMesh]:
     """Build every tile in a preset (1 tile normally, 4 for the Tier-3 mega map)."""
     return [
         build_tile(t, carve_water=carve_water, engrave_roads=engrave_roads,
-                   add_supports=add_supports, weld=weld,
+                   add_supports=add_supports, min_feature_mm=min_feature_mm, weld=weld,
                    fetch_models=fetch_models, sketchfab_token=sketchfab_token)
         for t in tiles
     ]

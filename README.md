@@ -178,6 +178,17 @@ stay printable.
 > you want the open look. Pier spacing/clearance/support spacing are tunable in
 > `mesh_generator`.
 
+### Minimum printable feature
+
+**Min printable feature (mm)** removes anything too thin to print — hairline
+sliver buildings, one-pixel roads, thin tabs left by cropping. It's a
+morphological *opening* (erode by half the width, then dilate back), so
+sub-threshold slivers and spikes disappear while everything at or above the
+threshold is untouched. Thin bridge elements (posts, cables, hangers, arch ribs)
+are floored to the same value. Default is 0.1 mm; set it to your nozzle /
+resolution (e.g. 0.4 mm for a 0.4 mm FDM nozzle) to strip anything that printer
+can't resolve.
+
 ### Print supports
 
 **Add print supports** (on by default) detects overhangs that couldn't print
@@ -263,6 +274,7 @@ detail, height or model options recomputes the mesh only — never the OSM data.
 | Raised road height | `mesh_generator.ROAD_RAISE_MM` | 0.6 mm |
 | Bridge clearance / deck / pier spacing | `mesh_generator.BRIDGE_CLEARANCE_MM / _DECK_MM / _PIER_SPACING_MM` | 2.2 / 0.9 / 16 mm |
 | Print support max span / post size | `mesh_generator.SUPPORT_MAX_SPAN_MM / SUPPORT_POST_MM` | 8 / 0.9 mm |
+| Minimum printable feature | `geometry_processor.DEFAULT_MIN_FEATURE_MM` | 0.1 mm |
 | Carve depth | `mesh_generator.CARVE_MAX_MM` | 1.2 mm |
 | Building base embed | `mesh_generator.EMBED_MM` | 0.2 mm |
 | Park pad thickness | `mesh_generator.PARK_MAX_MM` | 0.8 mm |

@@ -72,6 +72,7 @@ LANDMARK_MANMADE = {"tower", "monument", "obelisk", "statue", "lighthouse", "cam
 MONUMENT_DEFAULT_HEIGHT_M = 30.0  # fallback print height for an untagged monument
 MONUMENT_POINT_RADIUS_M = 6.0     # footprint radius given to a point attraction
 MONUMENT_MAX_AREA_M2 = 8000.0     # skip huge attraction areas (theme parks etc.)
+DEFAULT_MIN_FEATURE_MM = 0.1      # thinner printed features are removed (unprintable)
 
 # Default share of a building's printed height given to its roof when the OSM
 # roof:height tag is missing, keyed by roof shape.
@@ -437,6 +438,23 @@ def _only_polygons(geom):
     return None
 
 
+def _open_min_feature(geom, min_mm: float):
+    """Drop parts of a mm-space polygon thinner than ``min_mm`` (unprintable).
+
+    A morphological opening (erode by half the min thickness, then dilate back)
+    deletes hairline slivers/spikes while leaving anything at or above the
+    threshold intact. Returns None if nothing printable remains.
+    """
+    if geom is None or geom.is_empty or min_mm <= 0:
+        return geom
+    try:
+        opened = geom.buffer(-min_mm / 2.0, join_style=2).buffer(min_mm / 2.0, join_style=2)
+    except Exception:  # noqa: BLE001
+        return geom
+    opened = _only_polygons(opened)
+    return opened if (opened is not None and not opened.is_empty) else None
+
+
 def _soft_cap(height_mm: float, cap_mm: float) -> float:
     """Smoothly bound a height toward ``cap_mm`` while staying near-linear when low.
 
@@ -692,6 +710,7 @@ def prepare_tiles(
     include_roads: bool = True,
     include_parks: bool = True,
     road_detail: str = DEFAULT_ROAD_DETAIL,
+    min_feature_mm: float = DEFAULT_MIN_FEATURE_MM,
     seed: int = 42,
 ) -> list[TileGeom]:
     """Turn fetched OSM layers into a list of millimetre-space ``TileGeom`` tiles.
@@ -776,9 +795,9 @@ def prepare_tiles(
             tile = TileGeom(
                 name=name,
                 size_w_mm=tile_w_mm, size_h_mm=tile_h_mm, base_mm=preset["base_mm"],
-                water=_to_tile_mm(_crop(water_geom, tile_box), tcx, tcy, scale),
-                roads=_to_tile_mm(_crop(roads_geom, tile_box), tcx, tcy, scale),
-                parks=_to_tile_mm(_crop(parks_geom, tile_box), tcx, tcy, scale),
+                water=_open_min_feature(_to_tile_mm(_crop(water_geom, tile_box), tcx, tcy, scale), min_feature_mm),
+                roads=_open_min_feature(_to_tile_mm(_crop(roads_geom, tile_box), tcx, tcy, scale), min_feature_mm),
+                parks=_open_min_feature(_to_tile_mm(_crop(parks_geom, tile_box), tcx, tcy, scale), min_feature_mm),
             )
             tile.bridges = _bridge_lines_to_tile(bridge_lines, tile_box, tcx, tcy, scale)
 
@@ -794,12 +813,13 @@ def prepare_tiles(
                 in_tile = gpd.clip(bulk, tile_box)
                 in_tile = in_tile[in_tile.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
                 tile.building_bins = _bin_buildings(
-                    in_tile, tcx, tcy, scale, z_mult, max_height_mm, overall, union=not use_terrain)
+                    in_tile, tcx, tcy, scale, z_mult, max_height_mm, overall,
+                    min_feature_mm, union=not use_terrain)
 
             if detail is not None and not detail.empty:
                 in_tile = gpd.clip(detail, tile_box)
                 in_tile = in_tile[in_tile.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-                generic, records = _build_tile_detail(in_tile, tcx, tcy, scale)
+                generic, records = _build_tile_detail(in_tile, tcx, tcy, scale, min_feature_mm)
                 tile.detail_buildings = generic
                 tile.landmarks = records
 
@@ -808,12 +828,14 @@ def prepare_tiles(
     return results
 
 
-def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_height_mm, overall=1.0, union=True):
+def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_height_mm,
+                   overall=1.0, min_feature_mm=DEFAULT_MIN_FEATURE_MM, union=True):
     """Bulk buildings as (height_mm, geometry).
 
     ``union=True`` merges overlapping footprints per height bin (flat base, kills
     internal faces). ``union=False`` keeps each building separate — required for
     terrain, where every building is draped onto its own ground elevation.
+    Footprints thinner than ``min_feature_mm`` are dropped as unprintable.
     """
     if in_tile.empty:
         return []
@@ -829,12 +851,14 @@ def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_heigh
         if union:
             bins.setdefault(key, []).append(geom)
         else:
-            entries.append((key, geom))
+            geom = _open_min_feature(geom, min_feature_mm)
+            if geom is not None:
+                entries.append((key, geom))
     if not union:
         return entries
     out = []
     for height_mm, geoms in sorted(bins.items()):
-        merged = _only_polygons(unary_union(geoms))
+        merged = _open_min_feature(_only_polygons(unary_union(geoms)), min_feature_mm)
         if merged is not None and not merged.is_empty:
             out.append((height_mm, merged))
     return out
@@ -861,7 +885,7 @@ def _assign_detail_heights(detail: gpd.GeoDataFrame, mult: float, scale: float, 
     return detail
 
 
-def _build_tile_detail(in_tile: gpd.GeoDataFrame, tcx, tcy, scale):
+def _build_tile_detail(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, min_feature_mm=DEFAULT_MIN_FEATURE_MM):
     """Split cropped detail rows into generic part-pieces and landmark records.
 
     Returns (generic_pieces, landmark_records) where generic_pieces is a list of
@@ -874,7 +898,7 @@ def _build_tile_detail(in_tile: gpd.GeoDataFrame, tcx, tcy, scale):
     generic: list[tuple[float, float, object]] = []
     groups: dict[str, dict] = {}
     for _, row in in_tile.iterrows():
-        geom = _to_tile_mm(row.geometry, tcx, tcy, scale)
+        geom = _open_min_feature(_to_tile_mm(row.geometry, tcx, tcy, scale), min_feature_mm)
         if geom is None:
             continue
         zb = max(0.0, _as_float(row.get("pz_b")))

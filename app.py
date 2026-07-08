@@ -401,6 +401,12 @@ def main() -> None:
                  "decks over their open spans) and adds thin snippable posts from the "
                  "underside down to the base/terrain, so the model prints as-is.",
         )
+        min_feature_mm = st.slider(
+            "Min printable feature (mm)", min_value=0.05, max_value=1.0, value=0.1, step=0.05,
+            help="Features (thin buildings, hairline roads, slivers) thinner than this "
+                 "are removed as unprintable. Set to your nozzle/resolution (e.g. 0.4 "
+                 "for a 0.4 mm FDM nozzle).",
+        )
         weld = st.checkbox(
             "Weld into single manifold (boolean union — slower)", value=False,
             help="Off: fast concatenation (buildings embedded into the base, "
@@ -467,13 +473,14 @@ def main() -> None:
                     include_roads=inc_roads,
                     include_parks=inc_parks,
                     road_detail=road_detail,
+                    min_feature_mm=min_feature_mm,
                 )
             spin = "Extruding {n} tile(s), fetching landmark models, exporting STL…" if fetch_models \
                 else "Extruding {n} tile(s) and exporting STL…"
             with st.spinner(spin.format(n=len(tiles))):
                 meshes = mesh_generator.build_all(
                     tiles, carve_water=carve_water, engrave_roads=engrave_roads,
-                    add_supports=add_supports, weld=weld,
+                    add_supports=add_supports, min_feature_mm=min_feature_mm, weld=weld,
                     fetch_models=fetch_models, sketchfab_token=sketchfab_token,
                 )
 
