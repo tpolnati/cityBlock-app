@@ -133,7 +133,7 @@ def _render_tile_preview(tile: geometry_processor.TileGeom) -> None:
     _plot_polys(ax, tile.parks, color="#7bb274", alpha=0.5, linewidth=0)
     _plot_polys(ax, tile.water, color="#4a90d9", alpha=0.7, linewidth=0)
     _plot_polys(ax, tile.roads, color="#888888", alpha=0.8, linewidth=0)
-    for line_mm, width_mm in tile.bridges:
+    for line_mm, width_mm, _structure in tile.bridges:
         _plot_polys(ax, line_mm.buffer(max(width_mm, 1.0) / 2.0),
                     color="#c0563b", alpha=0.95, linewidth=0)
     for _h, geom in tile.building_bins:
@@ -339,6 +339,14 @@ def main() -> None:
             help="Adjusting this recomputes ONLY the 3D mesh — the OSM data is "
                  "cached and is not re-downloaded.",
         )
+        overall_exaggeration = st.slider(
+            "Overall exaggeration ×",
+            min_value=0.5, max_value=4.0, value=1.0, step=0.1,
+            help="Scales every building and landmark height by the same factor, "
+                 "preserving their relative proportions (unlike the Z-multiplier, "
+                 "this keeps all sizes in the same ratio). Raise Max relief height "
+                 "alongside it for closer-to-true-scale proportions.",
+        )
 
         detail_options = list(geometry_processor.DETAIL_LEVELS.keys())
         detail_level = st.select_slider(
@@ -451,6 +459,7 @@ def main() -> None:
                     detail_level=detail_level,
                     landmark_emphasis=landmark_emphasis,
                     max_height_mm=max_height_mm,
+                    overall_exaggeration=overall_exaggeration,
                     terrain=dem,
                     terrain_exaggeration=terrain_exagg,
                     terrain_cap_mm=terrain_cap,
@@ -488,6 +497,7 @@ def main() -> None:
             st.session_state["generated"] = generated
             st.session_state["model_sources"] = all_sources
             emph = f" · landmarks ×{landmark_emphasis:g}" if landmark_emphasis != 1.0 else ""
+            emph += f" · overall ×{overall_exaggeration:g}" if overall_exaggeration != 1.0 else ""
             terr = f" · terrain ×{terrain_exagg:g}" if (terrain_on and dem is not None) else ""
             roads_note = "engraved roads" if engrave_roads else "raised roads"
             supp = " · supports" if add_supports else ""

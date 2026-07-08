@@ -397,8 +397,10 @@ def _build_roads(gdf: gpd.GeoDataFrame, min_rank: int):
 
         if gtype in ("LineString", "MultiLineString"):
             if is_bridge:
+                structure = _first(_get(row, "bridge:structure"))
+                structure = str(structure).strip().lower() if _truthy(structure) else None
                 for seg in _iter_lines(geom):
-                    bridge_lines.append((seg, width))
+                    bridge_lines.append((seg, width, structure))
                 bridge_polys.append(geom.buffer(width / 2.0, cap_style=2, join_style=1))
             else:
                 road_pieces.append(geom.buffer(width / 2.0, cap_style=2, join_style=1))
@@ -463,16 +465,16 @@ def _crop(geom, tile_box):
 
 
 def _bridge_lines_to_tile(bridge_lines, tile_box, tcx, tcy, scale):
-    """Crop bridge centrelines to a tile and convert to (LineString_mm, width_mm)."""
+    """Crop bridge centrelines to a tile -> (LineString_mm, width_mm, structure)."""
     out = []
-    for line, width_m in bridge_lines:
+    for line, width_m, structure in bridge_lines:
         if line is None or line.is_empty:
             continue
         clipped = line.intersection(tile_box)
         for seg in _iter_lines(clipped):
             seg_mm = _to_tile_mm(seg, tcx, tcy, scale)
             if seg_mm is not None and seg_mm.length > 1.0:
-                out.append((seg_mm, width_m * scale))
+                out.append((seg_mm, width_m * scale, structure))
     return out
 
 
@@ -682,6 +684,7 @@ def prepare_tiles(
     detail_level: str = DEFAULT_DETAIL_LEVEL,
     landmark_emphasis: float = 1.0,
     max_height_mm: float = DEFAULT_MAX_HEIGHT_MM,
+    overall_exaggeration: float = 1.0,
     terrain=None,
     terrain_exaggeration: float = DEFAULT_TERRAIN_EXAGG,
     terrain_cap_mm: float = DEFAULT_TERRAIN_CAP_MM,
@@ -732,7 +735,7 @@ def prepare_tiles(
     water_geom = shp_translate(water_geom, -cx, -cy) if water_geom is not None else None
     roads_geom = shp_translate(roads_geom, -cx, -cy) if roads_geom is not None else None
     parks_geom = shp_translate(parks_geom, -cx, -cy) if parks_geom is not None else None
-    bridge_lines = [(shp_translate(line, -cx, -cy), w) for line, w in bridge_lines]
+    bridge_lines = [(shp_translate(line, -cx, -cy), w, s) for line, w, s in bridge_lines]
 
     # --- Crop-box geometry sized to the preset's physical aspect ratio --------
     full_w_mm, full_h_mm = preset["size_mm"]
@@ -749,9 +752,10 @@ def prepare_tiles(
     tile_h_m = (2.0 * half_h_m) / tiles_y
     tile_w_mm, tile_h_mm = preset["tile_size_mm"]
 
+    overall = max(0.0, overall_exaggeration)
     detail_mult = z_mult * max(0.0, landmark_emphasis)
     if detail is not None and not detail.empty:
-        detail = _assign_detail_heights(detail, detail_mult, scale, max_height_mm)
+        detail = _assign_detail_heights(detail, detail_mult, scale, max_height_mm, overall)
 
     # With terrain, buildings are draped onto the surface individually, so we must
     # not union footprints into shared height bins (each needs its own ground).
@@ -790,7 +794,7 @@ def prepare_tiles(
                 in_tile = gpd.clip(bulk, tile_box)
                 in_tile = in_tile[in_tile.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
                 tile.building_bins = _bin_buildings(
-                    in_tile, tcx, tcy, scale, z_mult, max_height_mm, union=not use_terrain)
+                    in_tile, tcx, tcy, scale, z_mult, max_height_mm, overall, union=not use_terrain)
 
             if detail is not None and not detail.empty:
                 in_tile = gpd.clip(detail, tile_box)
@@ -804,7 +808,7 @@ def prepare_tiles(
     return results
 
 
-def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_height_mm, union=True):
+def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_height_mm, overall=1.0, union=True):
     """Bulk buildings as (height_mm, geometry).
 
     ``union=True`` merges overlapping footprints per height bin (flat base, kills
@@ -819,7 +823,7 @@ def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_heigh
         geom = _to_tile_mm(row.geometry, tcx, tcy, scale)
         if geom is None:
             continue
-        height_mm = _soft_cap(_as_float(row.get("height_m")) * z_mult * scale, max_height_mm)
+        height_mm = overall * _soft_cap(_as_float(row.get("height_m")) * z_mult * scale, max_height_mm)
         height_mm = max(MIN_BUILDING_MM, height_mm)
         key = max(MIN_BUILDING_MM, round(round(height_mm / HEIGHT_BIN_MM) * HEIGHT_BIN_MM, 3))
         if union:
@@ -836,7 +840,7 @@ def _bin_buildings(in_tile: gpd.GeoDataFrame, tcx, tcy, scale, z_mult, max_heigh
     return out
 
 
-def _assign_detail_heights(detail: gpd.GeoDataFrame, mult: float, scale: float, cap: float):
+def _assign_detail_heights(detail: gpd.GeoDataFrame, mult: float, scale: float, cap: float, overall: float = 1.0):
     """Add printed ``pz_b`` / ``pz_t`` (mm) columns to landmark/part features.
 
     A landmark's overall top is soft-capped to the printable ceiling, but each of
@@ -849,7 +853,7 @@ def _assign_detail_heights(detail: gpd.GeoDataFrame, mult: float, scale: float, 
     pz_t = pd.Series(0.0, index=detail.index)
     for idx, row in detail.iterrows():
         h_real = _as_float(row.get("cluster_h_m")) or _as_float(row.get("zt_m")) or 1.0
-        target = _soft_cap(h_real * mult * scale, cap)
+        target = overall * _soft_cap(h_real * mult * scale, cap)
         pz_t[idx] = target * (_as_float(row.get("zt_m")) / h_real)
         pz_b[idx] = target * (max(0.0, _as_float(row.get("zb_m"))) / h_real)
     detail["pz_b"] = pz_b

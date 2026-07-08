@@ -47,6 +47,14 @@ BRIDGE_PIER_SIZE_MM = 1.6
 # more than this, filled with thin snippable posts (small cubes) to the surface.
 SUPPORT_MAX_SPAN_MM = 8.0
 SUPPORT_POST_MM = 0.9
+# Bridge superstructure (rendered by OSM bridge:structure) — towers, cables, arch.
+BRIDGE_TOWER_RISE_MM = 9.0       # tower height above the deck
+BRIDGE_TOWER_SIZE_MM = 2.0       # tower footprint (along the deck)
+BRIDGE_CABLE_R_MM = 0.5          # main suspension cable radius
+BRIDGE_HANGER_R_MM = 0.3         # vertical hanger / spandrel radius
+BRIDGE_ARCH_R_MM = 0.9           # arch rib radius
+SUSPENSION_STRUCTURES = {"suspension", "cable_stayed", "cable-stayed", "cablestayed"}
+ARCH_STRUCTURES = {"arch", "tied_arch", "tied-arch", "through_arch", "viaduct_arch"}
 
 
 @dataclass
@@ -252,33 +260,78 @@ def _bridge_column(p, ang, gs, deck_bottom, along, cross):
     return col
 
 
-def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True):
-    """Build an accurate bridge from a centreline: raised deck + support piers.
+def _cyl(p1, p2, r):
+    """A thin cylinder between two 3-D points (hanger / spandrel)."""
+    try:
+        return trimesh.creation.cylinder(radius=r, segment=[p1, p2], sections=8)
+    except Exception:  # noqa: BLE001 - degenerate/zero-length segment
+        return None
 
-    The deck is a flat slab held at a clearance above what it crosses, set to the
-    higher of its two abutment ends so it connects to the approaching roads.
-    Wide piers drop to the local ground at intervals (taller across a valley),
-    full-width abutments close off each end, and — when ``add_supports`` — thin
-    snippable posts subdivide the open spans so no downward-facing deck run is
-    left unsupported for printing. Everything welds deck-to-ground.
+
+def _tube(points, r, sections=8):
+    """A single watertight tube swept through a polyline (cable / arch rib).
+
+    Built as one closed body so chained segments don't leave non-manifold joints
+    the way many separate cylinders would after vertex merging.
     """
-    coords = list(line_mm.coords)
-    if len(coords) < 2 or width_mm <= 0:
-        return []
+    pts = np.asarray([p for p in points], dtype=float)
+    if len(pts) < 2:
+        return None
+    seg = np.diff(pts, axis=0)
+    tang = np.zeros_like(pts)
+    tang[1:-1] = seg[:-1] + seg[1:]
+    tang[0], tang[-1] = seg[0], seg[-1]
+    up = np.array([0.0, 0.0, 1.0])
 
+    ring = []
+    for P, T in zip(pts, tang):
+        tn = np.linalg.norm(T)
+        T = T / tn if tn > 1e-9 else np.array([1.0, 0.0, 0.0])
+        n1 = np.cross(T, up)
+        if np.linalg.norm(n1) < 1e-6:
+            n1 = np.cross(T, np.array([1.0, 0.0, 0.0]))
+        n1 /= (np.linalg.norm(n1) or 1.0)
+        n2 = np.cross(T, n1)
+        n2 /= (np.linalg.norm(n2) or 1.0)
+        for k in range(sections):
+            a = 2 * math.pi * k / sections
+            ring.append(P + r * (math.cos(a) * n1 + math.sin(a) * n2))
+    verts = list(ring)
+    faces = []
+    S = sections
+    for i in range(len(pts) - 1):
+        for k in range(S):
+            a, b = i * S + k, i * S + (k + 1) % S
+            c, d = (i + 1) * S + k, (i + 1) * S + (k + 1) % S
+            faces += [[a, b, d], [a, d, c]]
+    c0 = len(verts); verts.append(pts[0])
+    for k in range(S):
+        faces.append([c0, (k + 1) % S, k])
+    cN = len(verts); verts.append(pts[-1]); base = (len(pts) - 1) * S
+    for k in range(S):
+        faces.append([cN, base + k, base + (k + 1) % S])
+    try:
+        m = trimesh.Trimesh(vertices=np.asarray(verts), faces=np.asarray(faces), process=True)
+        m.merge_vertices(); m.fix_normals()
+        return m if not m.is_empty else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _perp(ang):
+    """Unit vector perpendicular to a heading (across the deck)."""
+    return (-math.sin(ang), math.cos(ang))
+
+
+def _deck_and_supports(line_mm, width_mm, ground_fn, add_supports, deck_bottom, deck_top, ang):
+    """The shared substructure: deck slab + piers/abutments + print supports."""
     length = line_mm.length
-    ang = float(np.arctan2(coords[-1][1] - coords[0][1], coords[-1][0] - coords[0][0]))
-    end_ground = max(ground_fn(*coords[0]), ground_fn(*coords[-1]))
-    deck_bottom = end_ground + BRIDGE_CLEARANCE_MM
-    deck_top = deck_bottom + BRIDGE_DECK_MM
-
     meshes = []
     ribbon = line_mm.buffer(width_mm / 2.0, cap_style=2, join_style=1)
     deck = _extrude(ribbon, deck_top - deck_bottom, z0=deck_bottom)
     if deck is not None:
         meshes.append(deck)
 
-    # Structural piers/abutments, inset so end abutments never overhang the edge.
     inset = BRIDGE_PIER_SIZE_MM / 2.0
     usable = max(0.0, length - 2.0 * inset)
     n = max(1, int(round(usable / BRIDGE_PIER_SPACING_MM)))
@@ -290,7 +343,6 @@ def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True
         if col is not None:
             meshes.append(col)
 
-    # Print supports: thin posts subdividing each pier gap to <= SUPPORT_MAX_SPAN.
     if add_supports:
         for a, b in zip(pier_ds, pier_ds[1:]):
             gap = b - a
@@ -301,6 +353,115 @@ def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True
                                      SUPPORT_POST_MM, SUPPORT_POST_MM)
                 if col is not None:
                     meshes.append(col)
+    return meshes
+
+
+def _suspension_superstructure(line_mm, width_mm, ground_fn, deck_top, ang):
+    """Two towers + draped main cables + vertical hangers (e.g. the Golden Gate)."""
+    length = line_mm.length
+    px, py = _perp(ang)
+    half = width_mm / 2.0
+    f1, f2 = 0.22, 0.78                       # tower positions along the span
+    tower_top = deck_top + BRIDGE_TOWER_RISE_MM
+    main_sag = BRIDGE_TOWER_RISE_MM * 0.62    # cable dip between towers
+    meshes = []
+
+    # Towers straddling the deck at f1 / f2.
+    for f in (f1, f2):
+        p = line_mm.interpolate(length * f)
+        gs = ground_fn(p.x, p.y)
+        col = _bridge_column(p, ang, gs, tower_top, BRIDGE_TOWER_SIZE_MM, width_mm)
+        if col is not None:
+            meshes.append(col)
+
+    def cable_z(s):
+        if s <= f1:
+            return deck_top + (tower_top - deck_top) * (s / f1)
+        if s >= f2:
+            return deck_top + (tower_top - deck_top) * ((1 - s) / (1 - f2))
+        t = (s - f1) / (f2 - f1)
+        return tower_top - main_sag * (1 - (2 * t - 1) ** 2)
+
+    steps = max(24, int(length / 3))
+    for side in (+1, -1):
+        pts = []
+        for k in range(steps + 1):
+            s = k / steps
+            p = line_mm.interpolate(length * s)
+            pts.append([p.x + px * side * half, p.y + py * side * half, cable_z(s)])
+        cable = _tube(pts, BRIDGE_CABLE_R_MM)
+        if cable is not None:
+            meshes.append(cable)
+        # hangers from the cable down to the deck edge, between the towers.
+        for k in range(steps + 1):
+            s = k / steps
+            if f1 < s < f2 and k % 2 == 0 and pts[k][2] - deck_top > 0.6:
+                h = _cyl(pts[k], [pts[k][0], pts[k][1], deck_top], BRIDGE_HANGER_R_MM)
+                if h is not None:
+                    meshes.append(h)
+    return meshes
+
+
+def _arch_superstructure(line_mm, width_mm, ground_fn, deck_bottom, deck_top, ang):
+    """A curved arch rib below the deck, springing from the banks, plus spandrels."""
+    length = line_mm.length
+    px, py = _perp(ang)
+    half = width_mm / 2.0 * 0.8
+    end_g = max(ground_fn(*line_mm.coords[0]), ground_fn(*line_mm.coords[-1]))
+    crown = deck_bottom - 0.2                 # arch peak just under the deck
+    rise = max(0.0, crown - end_g)
+    if rise < 1.0:
+        return []
+    meshes = []
+    steps = max(20, int(length / 3))
+    for side in (+1, -1):
+        pts = []
+        for k in range(steps + 1):
+            s = k / steps
+            p = line_mm.interpolate(length * s)
+            z = end_g + rise * math.sin(math.pi * s)
+            pts.append([p.x + px * side * half, p.y + py * side * half, z])
+        rib = _tube(pts, BRIDGE_ARCH_R_MM)
+        if rib is not None:
+            meshes.append(rib)
+        # spandrel columns from the arch up to the deck.
+        for k in range(steps + 1):
+            if 0 < k < steps and k % 3 == 0 and deck_bottom - pts[k][2] > 0.6:
+                col = _cyl(pts[k], [pts[k][0], pts[k][1], deck_bottom + EMBED_MM], BRIDGE_HANGER_R_MM)
+                if col is not None:
+                    meshes.append(col)
+    return meshes
+
+
+def _build_bridge(line_mm, width_mm: float, ground_fn, add_supports: bool = True, structure=None):
+    """Build a bridge from its centreline, rendered by ``bridge:structure``.
+
+    All types share a flat deck held at a clearance above what it crosses (set to
+    the higher abutment end so it meets the approach roads), with piers/abutments
+    and print supports. On top of that:
+      * suspension / cable-stayed -> two towers, draped main cables, hangers;
+      * arch -> a curved arch rib under the deck with spandrel columns;
+      * otherwise -> a beam/trestle bridge (deck on piers).
+    """
+    coords = list(line_mm.coords)
+    if len(coords) < 2 or width_mm <= 0:
+        return []
+
+    ang = float(np.arctan2(coords[-1][1] - coords[0][1], coords[-1][0] - coords[0][0]))
+    end_ground = max(ground_fn(*coords[0]), ground_fn(*coords[-1]))
+    deck_bottom = end_ground + BRIDGE_CLEARANCE_MM
+    deck_top = deck_bottom + BRIDGE_DECK_MM
+
+    meshes = _deck_and_supports(line_mm, width_mm, ground_fn, add_supports,
+                                deck_bottom, deck_top, ang)
+    s = (structure or "").strip().lower()
+    try:
+        if s in SUSPENSION_STRUCTURES:
+            meshes += _suspension_superstructure(line_mm, width_mm, ground_fn, deck_top, ang)
+        elif s in ARCH_STRUCTURES:
+            meshes += _arch_superstructure(line_mm, width_mm, ground_fn, deck_bottom, deck_top, ang)
+    except Exception:  # noqa: BLE001 - superstructure is best-effort; keep the deck
+        pass
     return meshes
 
 
@@ -410,9 +571,10 @@ def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool 
         if rm is not None:
             parts.append(rm)
 
-    # --- Bridges: accurate elevated decks with piers (+ print supports) -------
-    for line_mm, width_mm in tile.bridges:
-        parts.extend(_build_bridge(line_mm, width_mm, ground, add_supports=add_supports))
+    # --- Bridges: rendered by real-world structure (suspension/arch/beam) ------
+    for line_mm, width_mm, structure in tile.bridges:
+        parts.extend(_build_bridge(line_mm, width_mm, ground,
+                                   add_supports=add_supports, structure=structure))
 
     # --- Bulk buildings (draped onto the ground) ------------------------------
     for height_mm, geom in tile.building_bins:

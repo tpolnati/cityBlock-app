@@ -105,6 +105,11 @@ The **Landmark emphasis ×** slider adds extra height to landmarks/parts so they
 tower further above the city; **Max relief height** caps the tallest feature so
 prints stay sensible. Changing any of these recomputes the mesh only — no refetch.
 
+**Overall exaggeration ×** scales *every* building and landmark height by the same
+factor, so their **relative proportions are preserved** (unlike the Z-multiplier,
+which — with the soft cap — compresses the tallest features). Pair it with a high
+**Max relief height** for close-to-true-scale proportions across the whole map.
+
 ### Detailed landmark models (recognisable icons)
 
 OSM extrusion alone can't make the Burj Khalifa *look* like the Burj Khalifa. Turn
@@ -155,6 +160,17 @@ clearance above what it crosses, a row of **support piers** at intervals with
 the deck connects to the approaching roads. On terrain the piers grow taller
 across a valley/river so the deck stays level with its banks. The flat road under
 a deck is removed to avoid a doubled ribbon.
+
+Bridges are then rendered by their **`bridge:structure`** so they resemble the
+real thing:
+- **suspension / cable-stayed** → two towers rising above the deck, a draped main
+  cable along each edge, and vertical hangers down to the deck (e.g. the Golden
+  Gate);
+- **arch** → a curved arch rib under the deck with spandrel columns up to it;
+- anything else → a **beam / trestle** deck on piers.
+
+The cables and arch ribs are built as single watertight tubes, so ornate bridges
+stay printable.
 
 > Bridges have real open spans underneath. With **Add print supports** on (the
 > default) the app fills each span with thin snippable posts down to the base, so
