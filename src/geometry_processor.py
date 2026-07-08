@@ -130,6 +130,7 @@ ROAD_DETAIL_LEVELS = {
 }
 DEFAULT_ROAD_DETAIL = "Major + residential"
 BRIDGE_MIN_RANK = 2                  # ignore bridges on tiny/service-only ways
+BRIDGE_MIN_ELEVATED_M = 60.0         # shorter bridges (overpasses) stay flush road
 
 WATERWAY_WIDTH_M = {
     "river": 14.0, "canal": 10.0, "stream": 4.0, "dock": 12.0, "riverbank": 16.0,
@@ -395,6 +396,10 @@ def _build_roads(gdf: gpd.GeoDataFrame, min_rank: int):
         width = ROAD_WIDTH_M.get(hw, ROAD_WIDTH_DEFAULT_M)
         gtype = geom.geom_type
         is_bridge = _truthy(_get(row, "bridge")) and rank >= BRIDGE_MIN_RANK
+        # Short overpasses stay part of the road network (flush, no separate deck)
+        # so highways don't pop up/down and the road ribbon stays one clean solid.
+        if is_bridge and gtype in ("LineString", "MultiLineString") and geom.length < BRIDGE_MIN_ELEVATED_M:
+            is_bridge = False
 
         if gtype in ("LineString", "MultiLineString"):
             if is_bridge:

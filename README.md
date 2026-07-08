@@ -161,8 +161,14 @@ the deck connects to the approaching roads. On terrain the piers grow taller
 across a valley/river so the deck stays level with its banks. The flat road under
 a deck is removed to avoid a doubled ribbon.
 
-Bridges are then rendered by their **`bridge:structure`** so they resemble the
-real thing:
+Only **major spans** (longer than ~60 m) are rendered as elevated bridges; short
+**overpasses** stay part of the road network and hug the ground, so highways and
+interstates don't pop up and down at every crossing. On terrain, road ribbons are
+**densified before draping** so a long, sparse-vertex highway follows the surface
+smoothly instead of jumping between its far-apart vertices.
+
+Major bridges are then rendered by their **`bridge:structure`** so they resemble
+the real thing:
 - **suspension / cable-stayed** → two towers rising above the deck, a draped main
   cable along each edge, and vertical hangers down to the deck (e.g. the Golden
   Gate);

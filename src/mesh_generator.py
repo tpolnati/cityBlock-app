@@ -37,6 +37,9 @@ EMBED_MM = 0.2
 PARK_MAX_MM = 0.8
 # Raised-road ribbon thickness (mm).
 ROAD_RAISE_MM = 0.6
+# Densify draped layers to this edge length (mm) so long roads follow the terrain
+# instead of jumping between sparse vertices.
+DRAPE_SEGMENT_MM = 1.5
 # Accurate bridge: deck clearance above what it crosses, deck thickness, spacing
 # between support piers along the span, and pier column footprint (mm).
 BRIDGE_CLEARANCE_MM = 2.2
@@ -213,14 +216,26 @@ def _boundary_edges(faces: np.ndarray):
     return [order[k] for k, c in count.items() if c == 1]
 
 
-def _drape_layer(geom, sampler, z_offset: float, thickness: float) -> trimesh.Trimesh | None:
-    """A thin slab that follows the terrain surface (for water / roads / parks)."""
+def _drape_layer(geom, sampler, z_offset: float, thickness: float,
+                 seg_len: float = DRAPE_SEGMENT_MM) -> trimesh.Trimesh | None:
+    """A thin slab that follows the terrain surface (for water / roads / parks).
+
+    The polygon is densified (``segmentize``) before triangulating so the surface
+    is sampled at fine intervals along long features — otherwise a road with
+    sparse vertices (e.g. an interstate) drapes as flat planes that jump between
+    vertices instead of following the ground.
+    """
     meshes = []
     for poly in _iter_polys(geom):
         if poly.area <= 0:
             continue
         poly = poly.buffer(0)
         for clean in _iter_polys(poly):
+            if seg_len and seg_len > 0:
+                try:
+                    clean = clean.segmentize(seg_len)
+                except Exception:  # noqa: BLE001 - shapely <2 or degenerate ring
+                    pass
             try:
                 v2d, tris = trimesh.creation.triangulate_polygon(clean, engine="earcut")
             except Exception:  # noqa: BLE001
@@ -580,7 +595,7 @@ def build_tile(tile: TileGeom, *, carve_water: bool = True, engrave_roads: bool 
         if rm is not None:
             parts.append(rm)
 
-    # --- Bridges: rendered by real-world structure (suspension/arch/beam) ------
+    # --- Bridges: elevated spans (short overpasses were kept flush in the roads) -
     for line_mm, width_mm, structure in tile.bridges:
         parts.extend(_build_bridge(line_mm, width_mm, ground, add_supports=add_supports,
                                    structure=structure, min_feature_mm=min_feature_mm))
